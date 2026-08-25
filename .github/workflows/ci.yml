@@ -10,8 +10,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Enforced strict because the codebase is warning-clean.
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
   test:
-    name: Build & Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -29,23 +60,4 @@ jobs:
         run: cargo build --verbose
 
       - name: Test
-        run: cargo test --verbose
-
-  lint:
-    name: Format & Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: rustfmt
-        run: cargo fmt -- --check
-
-      # The codebase is currently warning-clean; enforce it.
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo test --all-targets --all-features --verbose
