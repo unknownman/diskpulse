@@ -1,8 +1,8 @@
 # diskpulse
 
-[![crates.io](https://img.shields.io/crates/v/diskpulse.svg)](https://crates.io/crates/diskpulse)
-[![license](https://img.shields.io/crates/l/diskpulse.svg)](#license)
-[![CI](https://github.com/unknownman/diskpulse/actions/workflows/ci.yml/badge.svg)](https://github.com/unknownman/diskpulse/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/diskpulse.svg)](https://crates.io/crates/diskpulse)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![CI](https://img.shields.io/github/actions/workflow/status/unknownman/diskpulse/ci.yml?branch=main&label=CI)](https://github.com/unknownman/diskpulse/actions)
 
 ![diskpulse demo](demo/diskpulse-demo.gif)
 
