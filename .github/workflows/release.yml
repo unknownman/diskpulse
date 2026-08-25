@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # Cross-compiled via `cross` (Docker-based toolchain).
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (foreign-Linux targets)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary (native Unix only)
+        if: "matrix.os != 'windows-latest' && !matrix.cross"
+        run: strip target/${{ matrix.target }}/release/diskpulse
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows-latest'
+        run: >
+          tar czf diskpulse-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          -C target/${{ matrix.target }}/release diskpulse
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: >
+          Compress-Archive -Path target/${{ matrix.target }}/release/diskpulse.exe
+          -DestinationPath diskpulse-${{ github.ref_name }}-${{ matrix.target }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: diskpulse-${{ github.ref_name }}-${{ matrix.target }}
+          path: diskpulse-${{ github.ref_name }}-${{ matrix.target }}.*
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release and attach archives
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: diskpulse-*
