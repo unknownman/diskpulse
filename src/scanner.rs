@@ -280,10 +280,8 @@ fn collect_groups(
 ) -> crate::errors::Result<HashMap<PathBuf, Vec<FlatEntry>>> {
     let mut groups: HashMap<PathBuf, Vec<FlatEntry>> = HashMap::new();
 
-    for entry in walker
-        .try_into_iter()
-        .map_err(|err| std::io::Error::other(err.to_string()))?
-    {
+    // WalkDirGeneric directly implements IntoIterator
+    for entry in walker {
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {

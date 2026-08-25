@@ -188,3 +188,32 @@ fn symlink_escape_is_judged_by_target_location() {
     let err = expect_variant(&evil_link, "link into Documents");
     assert!(matches!(err, SafetyError::ProtectedUserData(_)));
 }
+
+// ---------------------------------------------------------------------------
+// Profile-root protection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn home_and_profile_base_are_rejected() {
+    let home = std::env::var("HOME").expect("HOME is set on unix");
+    let home = Path::new(&home);
+
+    // $HOME itself stays blocked.
+    let err = expect_variant(home, "HOME");
+    assert!(matches!(err, SafetyError::ProtectedHomeRoot(_)), "{err}");
+
+    // Its parent (/home, /Users) holds every user profile: wiping it would
+    // destroy all accounts at once.
+    if let Some(profile_base) = home.parent() {
+        if profile_base.parent().is_some() {
+            let err = expect_variant(profile_base, "profile base");
+            assert!(matches!(err, SafetyError::ProtectedSystemPath(_)), "{err}");
+        }
+    }
+
+    // Control: a normal nested cache path remains plannable.
+    assert!(
+        validate_path_safety(&home.join(".cache/diskpulse-selfcheck")).is_ok(),
+        "over-blocking detected"
+    );
+}

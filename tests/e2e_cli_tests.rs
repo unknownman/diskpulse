@@ -521,3 +521,63 @@ fn e2e_viz_top_n_shows_pruned_summary() {
         "missing aggregated pruned row:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// TMPDIR poisoning: a hostile temp env must not elevate protected paths
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn poisoned_tmpdir_cannot_bypass_the_jail() {
+    // ~/Documents is ProtectedUserData. Before sanitization, TMPDIR=/
+    // made every absolute path "under temp", so the carve-out ran first
+    // and this deletion would have been allowed.
+    let docs = PathBuf::from(std::env::var("HOME").expect("HOME")).join("Documents");
+    fs::create_dir_all(&docs).expect("Documents dir");
+    let victim = docs.join("diskpulse-poison-victim.bin");
+
+    let poisoned = |victim_path: &PathBuf| {
+        fs::write(victim_path, b"keep").expect("write victim");
+        Command::new(bin())
+            .args([
+                "clean",
+                "--path",
+                docs.to_str().unwrap(),
+                "--apply",
+                "--yes",
+            ])
+            .env("TMPDIR", "/")
+            .env("TMP", "/")
+            .env("TEMP", "/")
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn diskpulse")
+    };
+
+    // Poisoned run: jail must refuse, victim must survive.
+    let out = poisoned(&victim);
+    assert_ne!(out.status.code(), Some(0), "poisoned env wiped the jail");
+    assert!(
+        victim.exists(),
+        "protected file deleted under poisoned TMPDIR"
+    );
+
+    // Control without poison variables: still refused for the same reason
+    // (ProtectedUserData), proving the refusal is jail logic, not an env
+    // parsing artifact.
+    fs::write(&victim, b"keep").expect("rewrite victim");
+    let out = Command::new(bin())
+        .args([
+            "clean",
+            "--path",
+            docs.to_str().unwrap(),
+            "--apply",
+            "--yes",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn diskpulse");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(victim.exists());
+    let _ = fs::remove_file(&victim);
+}

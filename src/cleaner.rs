@@ -401,13 +401,41 @@ fn cleanable_temp_prefixes() -> &'static [PathBuf] {
                 fs::canonicalize(&path).unwrap_or(path)
             })
             .collect();
+
         let os_temp = std::env::temp_dir();
         let canon_temp = fs::canonicalize(&os_temp).unwrap_or_else(|_| os_temp.clone());
-        // Keep both spellings: planning sees canonicalized candidates
-        // (`/private/var/...`) while execution-time lexical normalization
-        // yields the raw alias (`/var/...`).
-        prefixes.push(os_temp);
-        if canon_temp != prefixes[prefixes.len() - 1] {
+
+        // Sanitize OS temp dir against TMPDIR poisoning (e.g., TMPDIR=/).
+        // A poisoned value would mark the entire system "under temp" and
+        // bypass every other jail rule via the carve-out.
+        let is_safe = |p: &Path| -> bool {
+            if p.parent().is_none() {
+                return false;
+            }
+            if system_roots().iter().any(|r| p == r) {
+                return false;
+            }
+            if let Some(home) = base_dirs().map(|d| d.home_dir().to_path_buf()) {
+                if p == home {
+                    return false;
+                }
+                if let Some(parent) = home.parent() {
+                    if p == parent {
+                        return false;
+                    }
+                }
+            }
+            true
+        };
+
+        if is_safe(&os_temp) {
+            prefixes.push(os_temp);
+        }
+        let last = prefixes
+            .last()
+            .map(|p| p.as_path())
+            .unwrap_or(Path::new(""));
+        if canon_temp != last && is_safe(&canon_temp) {
             prefixes.push(canon_temp);
         }
         prefixes
@@ -431,17 +459,32 @@ pub fn validate_path_safety(path: &Path) -> Result<(), SafetyError> {
 
 /// Jail check for an already-normalized path.
 fn ensure_safe_location(normalized: &Path) -> Result<(), SafetyError> {
-    // The temp carve-out runs first: `/var/tmp` must survive the `/var` rule.
     let under_temp = is_cleanable_temp(normalized);
 
-    // Bare filesystem/drive roots ("/" on POSIX, any "D:\"-style volume root
-    // on Windows) terminate in a root and therefore have no parent. They are
-    // never deletable themselves — even when not enumerated in the static
-    // jail lists.
+    // 1. Bare filesystem roots ("/" on POSIX, any "D:\"-style volume root
+    //    on Windows) terminate in a root and therefore have no parent. They
+    //    are never deletable themselves — even when not enumerated in the
+    //    static jail lists.
     if normalized.parent().is_none() && !under_temp {
         return Err(SafetyError::ProtectedSystemPath(normalized.to_path_buf()));
     }
 
+    // 2. Resolve $HOME and its parent (/home, /Users, C:\Users). Wiping the
+    //    base directory holding all user profiles would destroy every
+    //    account at once.
+    if let Some(home) = base_dirs().map(|dirs| dirs.home_dir().to_path_buf()) {
+        if normalized == home {
+            return Err(SafetyError::ProtectedHomeRoot(home));
+        }
+        if let Some(parent) = home.parent() {
+            // Never allow wiping the base directory holding all user profiles
+            if normalized == parent {
+                return Err(SafetyError::ProtectedSystemPath(parent.to_path_buf()));
+            }
+        }
+    }
+
+    // 3. System roots
     if !under_temp {
         for root in system_roots() {
             // Bare filesystem/drive roots match exactly only — otherwise a
@@ -458,14 +501,8 @@ fn ensure_safe_location(normalized: &Path) -> Result<(), SafetyError> {
         }
     }
 
-    if let Some(home) = base_dirs().map(|dirs| dirs.home_dir().to_path_buf()) {
-        if normalized == home {
-            return Err(SafetyError::ProtectedHomeRoot(home));
-        }
-    }
-
+    // 4. Protected user directories
     for dir in protected_user_dirs() {
-        // Core personal folders are protected including everything inside.
         if normalized == dir || normalized.starts_with(&dir) {
             return Err(SafetyError::ProtectedUserData(dir));
         }
