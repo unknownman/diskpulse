@@ -613,12 +613,11 @@ fn collect_root_items(
             Err(_) => continue,
         };
         let file_type = meta.file_type();
-        // Symlink quarantine: a link inside a cache root is never a deletion
-        // unit — its real target lives elsewhere and must stay untouched.
-        if file_type.is_symlink() {
-            continue;
-        }
-        let is_dir = file_type.is_dir();
+        // Symlinks ARE valid deletion units — the link itself gets unlinked,
+        // never followed. `is_dir` stays false for them so execution removes
+        // just the link, leaving the target's contents untouched.
+        let is_symlink = file_type.is_symlink();
+        let is_dir = file_type.is_dir() && !is_symlink;
 
         if is_dir && options.one_file_system {
             // Unknown device ids on either side mean "cannot prove a boundary"
@@ -633,6 +632,7 @@ fn collect_root_items(
         let size = if is_dir {
             tree_size(&path)
         } else {
+            // Links report their own metadata, never the target's.
             util::physical_disk_size(&meta)
         };
 

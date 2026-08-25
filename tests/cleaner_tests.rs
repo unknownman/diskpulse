@@ -124,36 +124,46 @@ fn dry_run_plan_does_not_mutate_filesystem() {
 
 #[cfg(unix)]
 #[test]
-fn plan_quarantines_symlinks_pointing_at_precious_data() {
+fn execution_unlinks_symlinks_without_touching_their_target() {
     let _documents_guard = TempDir::new().expect("tempdir");
     let precious = _documents_guard.path().join("thesis.pdf");
     touch(&precious, 512);
 
     let (_cache_guard, root) = sandbox_cache();
-    symlink(&precious, &root.join("evil-link"));
+    let link = root.join("evil-link");
+    symlink(&precious, &link);
+    let before = fs::metadata(&precious).expect("target metadata before");
 
     let options = CleanOptions {
         custom_path: Some(root.clone()),
-        apply: false,
+        apply: true,
+        yes: true,
         ..CleanOptions::default()
     };
     let plan = create_clean_plan(&options).expect("plan");
-
+    let link_item = plan
+        .items
+        .iter()
+        .find(|item| item.path == link)
+        .expect("symlink must be planned as an unlink-only deletion unit");
     assert!(
-        !plan
-            .items
-            .iter()
-            .any(|item| item.path == root.join("evil-link")),
-        "symlinked entries must never be planned for deletion"
+        !link_item.is_dir,
+        "a symlink is never treated as a directory"
     );
 
-    // The precious target survived planning untouched.
-    assert!(precious.is_file());
+    let report = execute_clean_plan(&plan, false).expect("execution");
+    assert!(!link.exists(), "the link itself was removed");
+    assert!(precious.is_file(), "target of the link survives");
 
-    // Even a forced execution attempt cannot follow the link.
-    let report = execute_clean_plan(&plan, true).expect("execution");
-    assert!(precious.is_file(), "target of quarantined link survives");
-    let _ = report;
+    // The precious file's identity is untouched (same size + mtime).
+    let after = fs::metadata(&precious).expect("target metadata after");
+    assert_eq!(before.len(), after.len());
+    assert_eq!(
+        before.modified().ok(),
+        after.modified().ok(),
+        "mtime of the link target changed"
+    );
+    assert_eq!(report.errors_count, 0);
 }
 
 // ---------------------------------------------------------------------------
