@@ -546,3 +546,36 @@ fn older_than_never_deletes_fresh_files_inside_old_directories() {
         "parent dirs remain after file-level clean"
     );
 }
+
+// ---------------------------------------------------------------------------
+// one-file-system execution + trash-mode symlink quarantine
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_carries_one_file_system_flag_and_execution_stays_bottom_up() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root = tmp.path().join("ofs-cache");
+    // Nested enough that contents_first ordering is exercised: leaves vanish
+    // before their parents all the way up.
+    let deep = root.join("l1/l2/l3/l4");
+    fs::create_dir_all(&deep).expect("mkdirs");
+    for i in 0..6 {
+        fs::write(deep.join(format!("f{i}.bin")), vec![0u8; 512]).expect("write");
+    }
+
+    let options = CleanOptions {
+        custom_path: Some(root.clone()),
+        apply: true,
+        one_file_system: true,
+        ..CleanOptions::default()
+    };
+    let plan = create_clean_plan(&options).expect("plan");
+    assert!(plan.one_file_system, "flag must ride on the plan");
+
+    let report = execute_clean_plan(&plan, false).expect("execute");
+    assert_eq!(report.errors_count, 0, "{report:?}");
+    // Deletion units are the root's direct children; the walkdir bottom-up
+    // path must still take the whole l1 subtree.
+    assert!(!root.join("l1").exists(), "subtree should be fully removed");
+    assert_eq!(report.items_freed, 1);
+}

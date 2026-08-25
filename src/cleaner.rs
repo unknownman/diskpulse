@@ -14,6 +14,7 @@ use std::time::{Instant, SystemTime};
 use chrono::{DateTime, Duration, Utc};
 use directories::{BaseDirs, UserDirs};
 use serde::Serialize;
+use walkdir::WalkDir;
 
 use crate::cli::CleanArgs;
 use crate::errors::{CleanError, DiskPulseError, SafetyError};
@@ -637,7 +638,11 @@ pub fn create_clean_plan(options: &CleanOptions) -> Result<CleanPlan, DiskPulseE
         }
     }
 
-    Ok(CleanPlan::from_items(items, !options.apply))
+    let mut plan = CleanPlan::from_items(items, !options.apply);
+    // The mount boundary is an execution-time concern; carry it on the plan
+    // so `execute_clean_plan` can enforce it without signature churn.
+    plan.one_file_system = options.one_file_system;
+    Ok(plan)
 }
 
 /// Expand the requested target list against the registry:
@@ -815,7 +820,7 @@ fn collect_entry(
     }
 
     let size = if is_dir {
-        tree_size(&path)
+        tree_size(&path, options.one_file_system, parent_dev)
     } else {
         // Links report their own metadata, never the target's.
         util::physical_disk_size(meta)
@@ -852,7 +857,7 @@ fn effective_cutoff(age: Option<Duration>) -> Option<SystemTime> {
 /// onto the traversal stack and contribute zero bytes. Without link descent,
 /// cycles through directory symlinks are impossible, so termination is
 /// guaranteed even in adversarial caches.
-fn tree_size(dir: &Path) -> u64 {
+fn tree_size(dir: &Path, one_file_system: bool, root_dev: Option<u64>) -> u64 {
     let mut total = 0;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -867,6 +872,19 @@ fn tree_size(dir: &Path) -> u64 {
             };
             if file_type.is_symlink() {
                 continue;
+            }
+            if one_file_system {
+                // Skip subtrees AND bytes living on another filesystem:
+                // reclaimable-space accounting must mirror what deletion
+                // would actually touch.
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if let (Some(dev), Some(root)) = (util::device_id(&meta), root_dev) {
+                    if dev != root {
+                        continue;
+                    }
+                }
             }
             if file_type.is_dir() {
                 stack.push(entry.path());
@@ -902,7 +920,7 @@ pub fn execute_clean_plan(
         let status = if plan.is_dry_run {
             CleanItemStatus::SkippedDryRun
         } else {
-            match remove_item(&item.path, item.is_dir, use_trash) {
+            match remove_item(&item.path, item.is_dir, use_trash, plan.one_file_system) {
                 Ok(status) => {
                     bytes_freed += item.size;
                     items_freed += 1;
@@ -945,6 +963,7 @@ fn remove_item(
     path: &Path,
     is_dir: bool,
     use_trash: bool,
+    one_file_system: bool,
 ) -> std::result::Result<CleanItemStatus, String> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -962,15 +981,10 @@ fn remove_item(
         return Err(format!("blocked by safety jail: {safety}"));
     }
 
-    if use_trash {
-        return trash::delete(path)
-            .map(|_| CleanItemStatus::MovedToTrash)
-            .map_err(|err| format!("failed to trash {}: {err}", path.display()));
-    }
-
-    // Symlink quarantine: unlink the link itself, never its target. This
-    // branch wins even when the link points at a directory.
-    if meta.file_type().is_symlink() || !meta.is_dir() {
+    // Symlink quarantine outranks trash mode: links are ALWAYS hard-unlinked
+    // in place and never handed to the OS trash API, whose move semantics
+    // must never be trusted with a link's target.
+    if meta.file_type().is_symlink() {
         #[cfg(unix)]
         {
             fs::remove_file(path)
@@ -992,6 +1006,16 @@ fn remove_item(
                     .map_err(|err| deletion_failed(path, err))
             }
         }
+    } else if use_trash {
+        trash::delete(path)
+            .map(|_| CleanItemStatus::MovedToTrash)
+            .map_err(|err| format!("failed to trash {}: {err}", path.display()))
+    } else if !meta.is_dir() {
+        fs::remove_file(path)
+            .map(|_| CleanItemStatus::Deleted)
+            .map_err(|err| deletion_failed(path, err))
+    } else if is_dir && one_file_system {
+        safe_remove_dir_all_one_fs(path, None)
     } else if is_dir {
         fs::remove_dir_all(path)
             .map(|_| CleanItemStatus::Deleted)
@@ -1001,6 +1025,74 @@ fn remove_item(
             .map(|_| CleanItemStatus::Deleted)
             .map_err(|err| deletion_failed(path, err))
     }
+}
+
+/// Bottom-up directory removal that refuses to cross filesystems.
+///
+/// `std::fs::remove_dir_all` unconditionally descends through mount points;
+/// a cache directory containing a mounted volume would be wiped across the
+/// boundary. This variant walks `contents_first` so children vanish before
+/// their parents, and any entry whose device id differs from the tree root
+/// aborts the whole item — leaving everything above the boundary intact.
+///
+/// `expected_dev` optionally pins the tree to a caller-known volume; `None`
+/// derives the reference from the item itself (self-consistent single-fs).
+fn safe_remove_dir_all_one_fs(
+    path: &Path,
+    expected_dev: Option<u64>,
+) -> std::result::Result<CleanItemStatus, String> {
+    let root_meta = fs::symlink_metadata(path).map_err(|err| deletion_failed(path, err))?;
+    let root_dev = util::device_id(&root_meta);
+    if let (Some(dev), Some(expected)) = (root_dev, expected_dev) {
+        if dev != expected {
+            return Err(format!(
+                "refusing to cross mount point at {}",
+                path.display()
+            ));
+        }
+    }
+
+    for entry in WalkDir::new(path)
+        .contents_first(true)
+        .follow_links(false)
+        .into_iter()
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                return Err(format!("traversal failed under {}: {err}", path.display()));
+            }
+        };
+        let child = entry.path();
+        if child == path {
+            continue; // The root goes last.
+        }
+        let child_meta = match fs::symlink_metadata(child) {
+            Ok(meta) => meta,
+            Err(err) => return Err(deletion_failed(child, err)),
+        };
+        // Symlinks report their own device id (the tree's volume), so links
+        // into other filesystems are still unlinked as links — quarantine
+        // semantics hold inside the walk too.
+        if let Some(dev) = util::device_id(&child_meta) {
+            if Some(dev) != root_dev {
+                return Err(format!(
+                    "refusing to cross mount point at {}",
+                    child.display()
+                ));
+            }
+        }
+        let result = if child_meta.is_dir() {
+            fs::remove_dir(child)
+        } else {
+            fs::remove_file(child)
+        };
+        result.map_err(|err| deletion_failed(child, err))?;
+    }
+
+    fs::remove_dir(path)
+        .map(|_| CleanItemStatus::Deleted)
+        .map_err(|err| deletion_failed(path, err))
 }
 
 fn deletion_failed(path: &Path, source: std::io::Error) -> String {
@@ -1021,6 +1113,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn trash_mode_never_hands_a_symlink_to_the_trash_api() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let target = tmp.path().join("payload.txt");
+        fs::write(&target, b"precious").expect("write");
+        let link = tmp.path().join("link_to_payload");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        // use_trash=true: the link must be hard-unlinked in place anyway.
+        let status = remove_item(&link, false, true, false).expect("remove link");
+        assert_eq!(status, CleanItemStatus::Deleted, "not MovedToTrash");
+        assert!(!link.exists(), "link should be gone");
+        assert!(
+            target.exists(),
+            "trash API followed the symlink and took the target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn remove_item_refuses_real_paths_behind_symlinked_parents() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
 
@@ -1029,7 +1140,7 @@ mod tests {
         let plain = tmp.path().join("plain.bin");
         fs::write(&plain, b"x").expect("write");
         assert!(matches!(
-            remove_item(&plain, false, false),
+            remove_item(&plain, false, false, false),
             Ok(CleanItemStatus::Deleted)
         ));
 
@@ -1040,7 +1151,7 @@ mod tests {
         std::os::unix::fs::symlink("/", &link).expect("symlink");
         let via_link = link.join("etc/hosts");
 
-        let result = remove_item(&via_link, false, false);
+        let result = remove_item(&via_link, false, false, false);
         assert!(
             result.is_err(),
             "deletion through symlinked parent must be refused"

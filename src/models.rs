@@ -231,6 +231,11 @@ pub struct CleanPlan {
     pub total_bytes: u64,
     pub total_items: usize,
     pub is_dry_run: bool,
+    /// Execution-time mount boundary. When true, directory items are
+    /// deleted bottom-up and any filesystem crossing aborts the item
+    /// instead of wiping through it (`cleaner::safe_remove_dir_all_one_fs`).
+    #[serde(default)]
+    pub one_file_system: bool,
 }
 
 impl CleanPlan {
@@ -291,6 +296,7 @@ impl CleanPlan {
             total_bytes,
             total_items,
             is_dry_run,
+            one_file_system: false,
         }
     }
 }
