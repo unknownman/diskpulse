@@ -226,6 +226,10 @@ pub struct VizArgs {
     #[arg(short, long, default_value = "size")]
     pub sort: String,
 
+    /// Exclude paths matching this glob pattern (repeatable)
+    #[arg(long = "exclude", value_name = "GLOB")]
+    pub exclude: Vec<String>,
+
     /// Report logical file sizes instead of allocated disk blocks
     #[arg(long)]
     pub apparent_size: bool,
@@ -260,6 +264,15 @@ impl VizArgs {
                 reason: "must be at least 1".into(),
             }
             .into());
+        }
+        for pattern in &self.exclude {
+            if let Err(err) = globset::Glob::new(pattern) {
+                return Err(ParseError::InvalidFlagValue {
+                    flag: "exclude".into(),
+                    reason: format!("invalid glob {pattern:?}: {err}"),
+                }
+                .into());
+            }
         }
         crate::scanner::SortCriterion::parse(&self.sort)?;
         if let Some(raw) = &self.min_size {
@@ -312,6 +325,13 @@ impl CleanArgs {
         if self.yes && !self.apply {
             return Err(crate::errors::SafetyError::InvalidCliCombination(
                 "--yes flag was provided without --apply. To prevent accidental operations, --yes requires --apply."
+                    .to_string(),
+            )
+            .into());
+        }
+        if self.path.is_some() && !self.targets.is_empty() {
+            return Err(crate::errors::SafetyError::InvalidCliCombination(
+                "--path cannot be combined with explicit target IDs; use one or the other."
                     .to_string(),
             )
             .into());

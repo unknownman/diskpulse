@@ -102,6 +102,12 @@ pub enum ScanError {
     PermissionDenied(PathBuf),
 
     #[error("filesystem loop detected at {0:?}")]
+    /// Reserved for future traversal modes (e.g. if symlink-following is
+    /// ever added). Currently unused by `src/scanner.rs`: the walker runs
+    /// with `follow_links(false)`, which makes filesystem loops structurally
+    /// impossible, so this variant can never be constructed today. The
+    /// remediation hint in `src/ui.rs` stays wired up so the variant is
+    /// ready the moment a following mode exists.
     FilesystemLoopDetected(PathBuf),
 }
 

@@ -134,6 +134,18 @@ const SEPARATOR_WIDTH: usize = 80;
 /// Launch the animated scan progress indicator (drawn on stderr, so stdout
 /// stays clean for redirection). The caller owns the lifecycle and must call
 /// `finish_and_clear()` once scanning completes.
+/// Determinate bar for batch deletions; drawn on stderr by indicatif's
+/// default draw target, so stdout tables/JSON stay clean.
+pub fn clean_progress_bar(total_items: usize) -> ProgressBar {
+    let bar = ProgressBar::new(total_items as u64);
+    bar.set_style(
+        ProgressStyle::with_template("{bar:40.cyan/blue} {pos}/{len} items removed ({elapsed})")
+            .expect("progress template is statically valid")
+            .progress_chars("=>-"),
+    );
+    bar
+}
+
 pub fn scan_spinner(target: &Path) -> ProgressBar {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -216,21 +228,6 @@ fn fill_blocks(percent: f64) -> usize {
     (((percent.clamp(0.0, 100.0) / 100.0) * BAR_WIDTH as f64).round() as usize).min(BAR_WIDTH)
 }
 
-/// Compact two-decimal size label (e.g. `"140.20 KB"`, `"3.80 GB"`).
-fn size_label(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.2} {}", UNITS[unit])
-}
-
 /// Color policy for viz rendering. When disabled, every method returns the
 /// plain text; when enabled, output is additionally gated on stdout's color
 /// support (TTY detection, `NO_COLOR`, overrides).
@@ -257,7 +254,7 @@ impl Palette {
     /// Size labels tier by absolute magnitude:
     /// green below 10 MB, yellow below 500 MB, red above.
     fn size(&self, bytes: u64) -> String {
-        let label = size_label(bytes);
+        let label = crate::util::format_bytes(bytes);
         if bytes < 10 * MIB {
             self.paint(&label, |t| t.green().to_string())
         } else if bytes < 500 * MIB {
@@ -314,7 +311,7 @@ pub fn format_viz_tree(result: &ScanResult, options: &ScanOptions, no_color: boo
     out.push_str(&palette.subtle(&"─".repeat(SEPARATOR_WIDTH)));
     out.push('\n');
     out.push_str("Summary: ");
-    out.push_str(&palette.metric(&size_label(result.summary.total_size)));
+    out.push_str(&palette.metric(&crate::util::format_bytes(result.summary.total_size)));
     out.push_str(" allocated across ");
     out.push_str(&palette.metric(&thousands(result.summary.total_files)));
     out.push_str(" files and ");
@@ -333,7 +330,7 @@ fn append_hints(out: &mut String, options: &ScanOptions, palette: &Palette) {
         hints.push(format!("sorted by {}", sort_label(options.sort_by)));
     }
     if let Some(min_size) = options.min_size {
-        hints.push(format!("min {}", size_label(min_size)));
+        hints.push(format!("min {}", crate::util::format_bytes(min_size)));
     }
     if let Some(top_n) = options.top_n {
         if top_n != DEFAULT_TOP {
@@ -414,7 +411,7 @@ fn push_pruned_summary_row(
         "⋯ and {} other {} ({} total)",
         thousands(node.pruned_entries),
         noun,
-        size_label(node.pruned_size)
+        crate::util::format_bytes(node.pruned_size)
     );
     out.push_str(prefix);
     out.push_str("└── ");
@@ -530,7 +527,7 @@ pub fn confirmation_prompt(item_count: usize, use_trash: bool) -> String {
 
 /// Pre-execution banner body describing what applying will do.
 ///
-/// `size_label`/`count_label` are pre-formatted (e.g. `"21.05 MB"`, `"420"`).
+/// `size_label`/`count_label` are pre-formatted (e.g. `"21.05 MiB"`, `"420"`).
 pub fn apply_warning(size_label: &str, count_label: &str, use_trash: bool) -> String {
     if use_trash {
         format!("Applying will move {size_label} across {count_label} items to the trash.")
@@ -578,7 +575,7 @@ pub fn render_clean_plan_table(plan: &CleanPlan, is_apply: bool, use_trash: bool
             Cell::new(target.target_name.clone()),
             Cell::new(target.path.display().to_string()),
             Cell::new(item_count_label(target.item_count)),
-            Cell::new(size_label(target.total_bytes)),
+            Cell::new(crate::util::format_bytes(target.total_bytes)),
         ]);
     }
     table.add_row(vec![
@@ -589,7 +586,7 @@ pub fn render_clean_plan_table(plan: &CleanPlan, is_apply: bool, use_trash: bool
         Cell::new(item_count_label(plan.total_items))
             .fg(Color::Cyan)
             .add_attribute(Attribute::Bold),
-        Cell::new(size_label(plan.total_bytes))
+        Cell::new(crate::util::format_bytes(plan.total_bytes))
             .fg(Color::Cyan)
             .add_attribute(Attribute::Bold),
     ]);
@@ -601,7 +598,7 @@ pub fn render_clean_plan_table(plan: &CleanPlan, is_apply: bool, use_trash: bool
             warning(&format!(
                 "⚠  {} Confirmation required unless --yes.",
                 apply_warning(
-                    &size_label(plan.total_bytes),
+                    &crate::util::format_bytes(plan.total_bytes),
                     &thousands(u64::try_from(plan.total_items).unwrap_or(u64::MAX)),
                     use_trash
                 )
@@ -637,7 +634,7 @@ pub fn render_clean_report_table(report: &CleanReport) -> Result<()> {
         table.add_row(vec![
             Cell::new(item.target_id.clone()),
             Cell::new(item.path.display().to_string()),
-            Cell::new(size_label(item.size)),
+            Cell::new(crate::util::format_bytes(item.size)),
             status_cell(&item.status),
         ]);
     }
@@ -645,7 +642,7 @@ pub fn render_clean_report_table(report: &CleanReport) -> Result<()> {
 
     println!(
         "Freed {} across {} items in {} ms.",
-        heading(&size_label(report.bytes_freed)),
+        heading(&crate::util::format_bytes(report.bytes_freed)),
         heading(&thousands(
             u64::try_from(report.items_freed).unwrap_or(u64::MAX)
         )),

@@ -19,6 +19,7 @@ fn opts() -> ScanOptions {
         include_hidden: true,
         one_file_system: false,
         sort_by: SortCriterion::Size,
+        exclude_patterns: Vec::new(),
     }
 }
 
@@ -83,12 +84,12 @@ fn tree_uses_unicode_branch_glyphs_and_hierarchy() {
     );
 
     // Root card and per-directory counts render.
-    assert!(tree.contains("📁 /tmp/project (Total: 8.00 KB, Apparent: 8.00 KB)"));
+    assert!(tree.contains("📁 /tmp/project (Total: 8 KiB, Apparent: 8 KiB)"));
     let src_line = tree.lines().find(|l| l.contains("📁 src")).unwrap();
     assert!(src_line.contains("[1 dirs, 2 files]"), "{src_line:?}");
 
     // Footer rule and summary line.
-    assert!(tree.contains("Summary: 8.00 KB allocated across 3 files and 2 directories"));
+    assert!(tree.contains("Summary: 8 KiB allocated across 3 files and 2 directories"));
     assert!(tree.contains('─'));
 }
 
@@ -153,12 +154,12 @@ fn confirmation_and_banner_wording_tracks_trash_mode() {
     );
 
     assert_eq!(
-        apply_warning("21.05 MB", "420", false),
-        "Applying will permanently delete 21.05 MB across 420 items."
+        apply_warning("21.05 MiB", "420", false),
+        "Applying will permanently delete 21.05 MiB across 420 items."
     );
     assert_eq!(
-        apply_warning("21.05 MB", "420", true),
-        "Applying will move 21.05 MB across 420 items to the trash."
+        apply_warning("21.05 MiB", "420", true),
+        "Applying will move 21.05 MiB across 420 items to the trash."
     );
 }
 
@@ -171,7 +172,7 @@ fn confirmation_and_banner_wording_tracks_trash_mode() {
 /// │   └── payload.bin
 /// ├── 📁 big-b/
 /// │   └── payload.bin
-/// └── ⋯ and 3 other items (36.00 KB total)
+/// └── ⋯ and 3 other items (36 KiB total)
 fn five_dir_fixture() -> ScanResult {
     let mut root = dir("project");
     for (name, size) in [
@@ -211,7 +212,7 @@ fn truncated_levels_render_aggregated_pruned_row() {
         tree.contains("⋯ and 3 other items ("),
         "missing summary row:\n{tree}"
     );
-    assert!(tree.contains("(24.00 KB total)"), "\n{tree}");
+    assert!(tree.contains("(24 KiB total)"), "\n{tree}");
 
     // Glyph balance: visible siblings keep ├; only the summary closes with └.
     for name in ["big-a", "big-b"] {
@@ -248,13 +249,13 @@ fn min_size_filtered_levels_render_pruned_row() {
 
     // README.md (2048) was dropped from the root level.
     assert!(
-        tree.contains("⋯ and 1 other item (2.00 KB total)"),
+        tree.contains("⋯ and 1 other item (2 KiB total)"),
         "singular wording expected:\n{tree}"
     );
     assert!(!tree.contains("README.md"), "\n{tree}");
     // src survives; totals remain truthful.
     assert!(tree.contains("📁 src"));
-    assert!(tree.contains("Total: 8.00 KB"));
+    assert!(tree.contains("Total: 8 KiB"));
 }
 
 #[test]

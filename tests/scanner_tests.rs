@@ -26,6 +26,7 @@ fn base_options() -> ScanOptions {
         include_hidden: true,
         one_file_system: false,
         sort_by: SortCriterion::Size,
+        exclude_patterns: Vec::new(),
     }
 }
 
@@ -230,4 +231,131 @@ fn scan_target_with_ignored_or_hidden_name_is_not_pruned_as_root() {
         );
         assert_eq!(result.root.size, 8 * KIB);
     }
+}
+
+// ---------------------------------------------------------------------------
+// --one-file-system coverage (single-device no-op + device_id plumbing)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn one_file_system_is_a_noop_on_a_single_device_tempdir() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root = tmp.path();
+    fs::create_dir(root.join("nested")).expect("mkdir");
+    fs::write(root.join("a.bin"), vec![0u8; 4096]).expect("write");
+    fs::write(root.join("nested/b.bin"), vec![0u8; 2048]).expect("write");
+    fs::write(root.join("nested/c.txt"), b"hello").expect("write");
+
+    let plain = scan_path(root, &base_options()).unwrap();
+    let ofs = scan_path(
+        root,
+        &ScanOptions {
+            one_file_system: true,
+            ..base_options()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        plain.summary.total_size, ofs.summary.total_size,
+        "over-pruning on a single filesystem"
+    );
+    assert_eq!(plain.summary.total_files, ofs.summary.total_files);
+    assert_eq!(plain.summary.total_dirs, ofs.summary.total_dirs);
+}
+
+#[cfg(unix)]
+#[test]
+fn one_file_system_option_reads_device_ids_consistently() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root = tmp.path();
+    fs::write(root.join("x.bin"), vec![0u8; 1024]).expect("write");
+    fs::write(root.join("y.bin"), vec![0u8; 512]).expect("write");
+
+    // device_id takes std Metadata; st_dev is the unix field it wraps.
+    let root_dev = diskpulse::util::device_id(&fs::metadata(root).expect("root stat"))
+        .expect("root has a device id");
+    for name in ["x.bin", "y.bin"] {
+        let dev = diskpulse::util::device_id(&fs::metadata(root.join(name)).expect(name))
+            .unwrap_or_else(|| panic!("{name} missing device id"));
+        assert_eq!(dev, root_dev, "{name} strayed off the root device");
+    }
+}
+
+#[test]
+fn exclude_glob_filters_matching_paths() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    // One full allocation block so the physical-size assertion stays exact.
+    fs::write(root.join("keep.txt"), vec![0u8; 4096]).expect("write");
+    fs::write(root.join("debug.log"), vec![0u8; 8192]).expect("write");
+
+    let options = ScanOptions {
+        exclude_patterns: vec!["*.log".to_string()],
+        ..base_options()
+    };
+    let result = scan_path(root, &options).unwrap();
+
+    let kept = names(&result.root);
+    assert!(
+        !kept.contains(&"debug.log"),
+        "excluded entry survived: {kept:?}"
+    );
+    assert!(kept.contains(&"keep.txt"));
+
+    // Exclusion happens before aggregation: excluded bytes/files must not
+    // leak into totals (unlike --min-size, which only prunes rendering).
+    assert_eq!(result.summary.total_files, 1);
+    assert_eq!(result.summary.total_size, 4096);
+}
+
+// ---------------------------------------------------------------------------
+// --top × non-size sorts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn top_n_with_sort_by_name_keeps_alphabetically_first() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    for name in ["a.bin", "b.bin", "c.bin", "d.bin", "e.bin"] {
+        write_file(root, name, 1024);
+    }
+
+    let options = ScanOptions {
+        sort_by: SortCriterion::Name,
+        top_n: Some(3),
+        ..base_options()
+    };
+    let result = scan_path(root, &options).unwrap();
+
+    assert_eq!(names(&result.root), vec!["a.bin", "b.bin", "c.bin"]);
+}
+
+#[test]
+fn top_n_with_sort_by_count_keeps_dirs_with_most_entries() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    // Size order deliberately differs from count order: dir_a holds the
+    // single LARGEST file, dir_b three tiny ones. A size-driven selection
+    // would keep dir_a and fail this test.
+    write_file(root, "dir_a/huge.bin", 40 * KIB);
+    for i in 0..3 {
+        write_file(root, &format!("dir_b/tiny{i}.bin"), 4 * KIB);
+    }
+    for i in 0..2 {
+        write_file(root, &format!("dir_c/mid{i}.bin"), 8 * KIB);
+    }
+
+    let options = ScanOptions {
+        sort_by: SortCriterion::Count,
+        top_n: Some(2),
+        ..base_options()
+    };
+    let result = scan_path(root, &options).unwrap();
+
+    assert_eq!(
+        names(&result.root),
+        vec!["dir_b", "dir_c"],
+        "top_n must follow entry count, not accumulated size"
+    );
 }

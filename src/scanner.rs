@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use jwalk::{Parallelism, WalkDirGeneric};
 use serde::Serialize;
 
@@ -84,7 +85,12 @@ pub struct ScanOptions {
     pub include_hidden: bool,
     /// Prune subtrees living on a different device than the scan root.
     pub one_file_system: bool,
+    /// Glob patterns excluding matching paths from the scan entirely
+    /// (before aggregation). Syntax is validated by `VizArgs::validate`;
+    /// patterns that still fail to compile here are silently skipped so
+    /// library callers cannot panic on bad input.
     pub sort_by: SortCriterion,
+    pub exclude_patterns: Vec<String>,
 }
 
 impl From<&VizArgs> for ScanOptions {
@@ -101,6 +107,7 @@ impl From<&VizArgs> for ScanOptions {
             include_hidden: args.hidden,
             one_file_system: args.one_file_system,
             sort_by: SortCriterion::parse(&args.sort).unwrap_or(SortCriterion::Size),
+            exclude_patterns: args.exclude.clone(),
         }
     }
 }
@@ -198,6 +205,17 @@ fn build_walker(
     let include_hidden = options.include_hidden;
     let no_ignore = options.no_ignore;
     let one_file_system = options.one_file_system;
+    // CLI validation already vetted syntax; a lib caller's bad pattern is
+    // skipped rather than fatal. Owned set: the closure is `Fn` across
+    // threads.
+    let mut exclude_builder = GlobSetBuilder::new();
+    for pattern in &options.exclude_patterns {
+        if let Ok(glob) = Glob::new(pattern) {
+            exclude_builder.add(glob);
+        }
+    }
+    let excludes = exclude_builder.build().unwrap_or_else(|_| GlobSet::empty());
+    let scan_root = root.to_path_buf();
 
     WalkDirGeneric::<((), EntrySizes)>::new(root)
         .skip_hidden(false)
@@ -238,6 +256,13 @@ fn build_walker(
                     }
                     if !no_ignore && IGNORED_DIRECTORIES.contains(&name.as_ref()) {
                         return false;
+                    }
+                    if !excludes.is_empty() {
+                        let path = entry.path();
+                        let rel = path.strip_prefix(&scan_root).unwrap_or(path.as_path());
+                        if excludes.is_match(rel) || excludes.is_match(name.as_ref()) {
+                            return false;
+                        }
                     }
                     true
                 }

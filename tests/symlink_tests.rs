@@ -9,7 +9,7 @@ use std::fs;
 
 use diskpulse::cleaner::CleanOptions;
 use diskpulse::cleaner::{create_clean_plan, execute_clean_plan};
-use diskpulse::models::CleanPlan;
+use diskpulse::models::{CleanItemStatus, CleanPlan};
 
 mod common;
 use common::TestWorkspace;
@@ -187,5 +187,104 @@ fn age_descent_into_fresh_dirs_skips_symlinked_subtrees() {
     assert!(
         !ws.join("cache/fresh_pkg/stale.bin").exists(),
         "stale real file was deleted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TOCTOU: retargeting attacks between create_clean_plan and execute
+// ---------------------------------------------------------------------------
+
+#[test]
+fn symlink_retargeted_between_plan_and_execute_is_rejected() {
+    let ws = TestWorkspace::new();
+    let cache = ws.path().join("cache");
+    let outside = ws.path().join("outside");
+    fs::create_dir_all(&cache).expect("cache dir");
+    fs::create_dir_all(&outside).expect("outside dir");
+    let harmless = outside.join("harmless.txt");
+    fs::write(&harmless, b"keep me").expect("write");
+
+    // Planned unit: a link pointing at a harmless file.
+    let link = cache.join("link");
+    std::os::unix::fs::symlink(&harmless, &link).expect("symlink");
+
+    let options = CleanOptions {
+        custom_path: Some(cache.clone()),
+        apply: true,
+        ..CleanOptions::default()
+    };
+    let plan = create_clean_plan(&options).expect("plan");
+    assert!(
+        plan.items.iter().any(|item| item.path == link),
+        "link must be a planned deletion unit"
+    );
+
+    // TOCTOU swap: same name, now aimed at the real home root. The jail
+    // re-check at execution time sees a SYMLINK item and therefore judges
+    // it LEXICALLY — quarantine unlinks the link itself, so the home root
+    // is unreachable by construction. `Deleted` is the safe-by-design
+    // outcome here, not a miss; a `Failed(ProtectedHomeRoot)` would mean
+    // the lexical model had regressed into target-following.
+    fs::remove_file(&link).expect("unlink planned link");
+    let home = directories::BaseDirs::new()
+        .expect("base dirs")
+        .home_dir()
+        .to_path_buf();
+    std::os::unix::fs::symlink(&home, &link).expect("retarget at home");
+
+    let report = execute_clean_plan(&plan, false).expect("execute");
+    let result = report
+        .results
+        .iter()
+        .find(|r| r.path == link)
+        .expect("retargeted item reported");
+    assert!(
+        matches!(result.status, CleanItemStatus::Deleted),
+        "quarantine must unlink the link lexically: {:?}",
+        result.status
+    );
+    assert!(!link.exists(), "retargeted link should be gone");
+    assert!(std::path::Path::new(&home).exists(), "home root vanished?!");
+    assert!(harmless.exists(), "original symlink target was disturbed");
+}
+
+#[test]
+fn real_file_whose_parent_swapped_to_protected_root_is_blocked() {
+    let ws = TestWorkspace::new();
+    let cache = ws.path().join("cache");
+    fs::create_dir_all(&cache).expect("cache dir");
+
+    // The planned file shares its name with a REAL system file so that,
+    // after the swap below, canonicalization resolves to an existing
+    // protected path instead of failing with ENOENT (which would also
+    // produce Failed — but for the wrong reason).
+    let victim_name = "hosts";
+    fs::write(cache.join(victim_name), b"harmless local copy").expect("write");
+
+    let options = CleanOptions {
+        custom_path: Some(cache.clone()),
+        apply: true,
+        ..CleanOptions::default()
+    };
+    let plan = create_clean_plan(&options).expect("plan");
+    assert_eq!(plan.items.len(), 1);
+
+    // TOCTOU swap: replace the whole cache dir with a link to /etc. The
+    // planned item now canonically resolves INTO protected space, which
+    // only the execution-time ensure_safe_location re-check can see.
+    fs::remove_dir_all(&cache).expect("swap out cache");
+    std::os::unix::fs::symlink("/etc", &cache).expect("cache -> /etc");
+
+    let report = execute_clean_plan(&plan, false).expect("execute");
+    let result = &report.results[0];
+    match &result.status {
+        CleanItemStatus::Failed(reason) => {
+            assert!(reason.contains("safety jail"), "{reason}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(
+        std::path::Path::new("/etc/hosts").exists(),
+        "/etc/hosts was deleted through the swapped parent"
     );
 }

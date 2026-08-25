@@ -17,6 +17,7 @@ ctrlc = { version = "3.4", features = ["termination"] }
 # High-Performance Directory Traversal
 jwalk = "0.8"
 walkdir = "2.5"
+globset = "0.4"
 
 # Platform-native directories
 directories = "5.0"

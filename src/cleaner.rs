@@ -13,6 +13,7 @@ use std::time::{Instant, SystemTime};
 
 use chrono::{DateTime, Duration, Utc};
 use directories::{BaseDirs, UserDirs};
+use indicatif::ProgressBar;
 use serde::Serialize;
 use walkdir::WalkDir;
 
@@ -909,6 +910,19 @@ pub fn execute_clean_plan(
     plan: &CleanPlan,
     use_trash: bool,
 ) -> Result<CleanReport, DiskPulseError> {
+    execute_clean_plan_with_progress(plan, use_trash, None)
+}
+
+/// [`execute_clean_plan`] with optional per-item progress reporting.
+///
+/// The progress callback fires after every attempted item (success or
+/// failure), so the bar always reaches `len` when the run completes.
+#[allow(clippy::needless_pass_by_value)]
+pub fn execute_clean_plan_with_progress(
+    plan: &CleanPlan,
+    use_trash: bool,
+    progress: Option<&ProgressBar>,
+) -> Result<CleanReport, DiskPulseError> {
     let started = Instant::now();
 
     let mut results = Vec::with_capacity(plan.items.len());
@@ -920,7 +934,8 @@ pub fn execute_clean_plan(
         let status = if plan.is_dry_run {
             CleanItemStatus::SkippedDryRun
         } else {
-            match remove_item(&item.path, item.is_dir, use_trash, plan.one_file_system) {
+            let status = match remove_item(&item.path, item.is_dir, use_trash, plan.one_file_system)
+            {
                 Ok(status) => {
                     bytes_freed += item.size;
                     items_freed += 1;
@@ -930,7 +945,11 @@ pub fn execute_clean_plan(
                     errors_count += 1;
                     CleanItemStatus::Failed(reason)
                 }
+            };
+            if let Some(p) = progress {
+                p.inc(1);
             }
+            status
         };
         results.push(CleanItemResult {
             path: item.path.clone(),
@@ -959,6 +978,14 @@ pub fn execute_clean_plan(
 /// - Real files and directories mutate through any symlinked parent chain,
 ///   so the canonicalized path decides. `/tmp/sandbox/link_to_usr/file`
 ///   therefore fails the jail even though its lexical spelling looks tame.
+///
+/// The `ensure_safe_location` call below is a deliberate TOCTOU
+/// (time-of-check-to-time-of-use) mitigation, NOT redundant paranoia: the
+/// plan was built earlier against a read-only scan, so anything on disk —
+/// including a symlink's target or an entire parent directory swapped for
+/// a link — may have changed between planning and this function actually
+/// mutating the filesystem. Re-deriving the jail target here, at the last
+/// possible moment, is what catches that race.
 fn remove_item(
     path: &Path,
     is_dir: bool,

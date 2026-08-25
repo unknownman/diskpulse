@@ -15,9 +15,13 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 
-use diskpulse::cleaner::{create_clean_plan, execute_clean_plan, CleanOptions, CleanTargetDef};
+use diskpulse::cleaner::{
+    create_clean_plan, execute_clean_plan, execute_clean_plan_with_progress, CleanOptions,
+    CleanTargetDef,
+};
 use diskpulse::cli::{CleanArgs, Cli, Commands, TargetsArgs, VizArgs};
 use diskpulse::errors::DiskPulseError;
+use diskpulse::models::CleanReport;
 use diskpulse::scanner::{self, ScanOptions};
 use diskpulse::ui;
 
@@ -150,7 +154,18 @@ fn cmd_clean(args: &CleanArgs, cli: &Cli) -> Result<()> {
     // The plan render above already carries the "nothing to do" notice.
     if plan.total_items == 0 {
         if cli.json {
-            return ui::render_clean_plan_json(&plan);
+            // Under --apply the scripting contract is a report shape
+            // (bytes_freed/items_freed), even when there was nothing to do.
+            let report = CleanReport {
+                plan: plan.clone(),
+                results: Vec::new(),
+                bytes_freed: 0,
+                items_freed: 0,
+                errors_count: 0,
+                duration_ms: 0,
+                dry_run: !options.apply,
+            };
+            return ui::render_clean_report_json(&report);
         }
         return Ok(());
     }
@@ -171,7 +186,14 @@ fn cmd_clean(args: &CleanArgs, cli: &Cli) -> Result<()> {
         }
     }
 
-    let report = execute_clean_plan(&plan, options.use_trash)?;
+    let report = if !cli.quiet && !cli.json && plan.total_items > 20 {
+        let bar = ui::clean_progress_bar(plan.total_items);
+        let out = execute_clean_plan_with_progress(&plan, options.use_trash, Some(&bar));
+        bar.finish_and_clear();
+        out?
+    } else {
+        execute_clean_plan(&plan, options.use_trash)?
+    };
     if cli.json {
         ui::render_clean_report_json(&report)
     } else if !cli.quiet {

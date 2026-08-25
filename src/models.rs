@@ -826,6 +826,15 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_loop_error_exit_code_is_one() {
+        // Reserved variant: never constructed today (follow_links(false)
+        // makes loops structurally impossible), but its exit contract is
+        // pinned here so a future symlink-following mode inherits it.
+        let err = DiskPulseError::Scan(ScanError::FilesystemLoopDetected(PathBuf::from("/loop")));
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
     fn parse_error_messages_include_input_and_reason() {
         let err = ParseError::InvalidByteSize {
             input: "100ZB".to_string(),

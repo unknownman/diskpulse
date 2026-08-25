@@ -122,3 +122,47 @@ fn invalid_min_size_is_a_usage_error_not_a_crash() {
     assert_eq!(run.code(), 2);
     assert!(run.stderr().contains("invalid byte size"));
 }
+
+#[test]
+fn path_and_explicit_targets_is_rejected() {
+    let run = BinRun::args(&["clean", "cargo-cache", "--path", "/tmp"]);
+    assert_eq!(
+        run.code(),
+        2,
+        "mixed --path + target IDs must be a usage error\nstderr: {}",
+        run.stderr()
+    );
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("--path cannot be combined with explicit target IDs"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn empty_plan_apply_json_has_report_shape_not_plan_shape() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let run = BinRun::args(&[
+        "clean",
+        "--apply",
+        "--yes",
+        "--json",
+        "--path",
+        tmp.path().to_str().unwrap(),
+    ]);
+    assert_eq!(run.code(), 0, "stderr: {}", run.stderr());
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&run.stdout()).expect("empty apply run must emit report JSON");
+    assert!(
+        parsed.get("bytes_freed").is_some(),
+        "report shape requires top-level bytes_freed: {parsed}"
+    );
+    assert!(
+        parsed.get("is_dry_run").is_none(),
+        "is_dry_run belongs nested under plan, not at top level: {parsed}"
+    );
+    assert_eq!(parsed["dry_run"], false);
+    assert_eq!(parsed["bytes_freed"], 0);
+    assert_eq!(parsed["plan"]["is_dry_run"], false);
+}
