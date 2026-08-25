@@ -51,14 +51,18 @@ fn safety_jail_rejects_protected_locations() {
     // Home root and personal folders must always be refused.
     if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
         assert!(validate_path_safety(&home).is_err(), "home root refused");
-        assert!(
-            validate_path_safety(&home.join("Documents")).is_err(),
-            "Documents refused"
-        );
-        assert!(
-            validate_path_safety(&home.join("Documents").join("a.txt")).is_err(),
-            "contents of Documents refused"
-        );
+        // Linux without a configured xdg-user-dirs reports no document
+        // dir at all, in which case diskpulse has nothing to protect
+        // there — only assert where the platform actually exposes one.
+        if let Some(docs) =
+            directories::UserDirs::new().and_then(|d| d.document_dir().map(Path::to_path_buf))
+        {
+            assert!(validate_path_safety(&docs).is_err(), "Documents refused");
+            assert!(
+                validate_path_safety(&docs.join("a.txt")).is_err(),
+                "contents of Documents refused"
+            );
+        }
         // Cache dirs under $HOME remain allowed.
         assert!(validate_path_safety(&home.join(".cache").join("anything")).is_ok());
     }

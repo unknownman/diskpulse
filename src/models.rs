@@ -98,7 +98,8 @@ impl DirectoryNode {
     /// Recursively sort children by accumulated size, largest first.
     /// The sort is stable, so equal sizes keep their insertion order.
     pub fn sort_by_size_descending(&mut self) {
-        self.children.sort_by(|a, b| b.size.cmp(&a.size));
+        self.children
+            .sort_by_key(|child| std::cmp::Reverse(child.size));
         for child in &mut self.children {
             child.sort_by_size_descending();
         }
@@ -106,7 +107,7 @@ impl DirectoryNode {
 
     /// Recursively sort children alphabetically by name.
     pub fn sort_by_name(&mut self) {
-        self.children.sort_by(|a, b| a.name.cmp(&b.name));
+        self.children.sort_by_key(|child| child.name.clone());
         for child in &mut self.children {
             child.sort_by_name();
         }

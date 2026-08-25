@@ -5,6 +5,9 @@
 //! target and never deleted through. Payloads living OUTSIDE the cleaned
 //! root must survive every operation byte-for-byte.
 
+// Unix-semantics suite: symlink(2), /etc, and $HOME layout assumptions.
+#![cfg(unix)]
+
 use std::fs;
 
 use diskpulse::cleaner::CleanOptions;
