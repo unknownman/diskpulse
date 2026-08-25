@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 # CLI Parsing
 clap = { version = "4.5", features = ["derive", "cargo", "env"] }
 clap_complete = "4.5"
+unicode-width = "0.2"
 
 # Graceful Ctrl+C handling on a dedicated thread
 ctrlc = { version = "3.4", features = ["termination"] }

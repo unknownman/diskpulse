@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use diskpulse::models::{DirectoryNode, ScanResult, ScanSummary};
 use diskpulse::scanner::{ScanOptions, SortCriterion};
-use diskpulse::ui::{capacity_bar, format_viz_json, format_viz_tree};
+use diskpulse::ui::{capacity_bar, display_width, format_viz_json, format_viz_tree};
 
 fn opts() -> ScanOptions {
     ScanOptions {
@@ -276,8 +276,8 @@ fn wide_unicode_names_keep_bar_column_aligned() {
     let mut root = dir("project");
     for (name, size) in [
         ("ascii.txt", 5_000),
-        ("日本語のファイル.txt", 4_000),
-        ("🚀emoji-name.bin", 3_000),
+        ("📁_test_文件_🚀.txt", 4_000),
+        ("日本語のファイル.txt", 3_000),
         ("микро-файл.dat", 2_000),
     ] {
         root.add_child(file(name, size));
@@ -300,18 +300,38 @@ fn wide_unicode_names_keep_bar_column_aligned() {
         true,
     );
 
-    // Every entry's proportional bar must start at the same CHARACTER offset
-    // (the project's alignment standard: visible char counts, not bytes or
-    // terminal cells).
+    // Every entry's proportional bar must start at the same VISUAL COLUMN:
+    // cells occupied on the terminal, where CJK/emoji names are two cells
+    // per character. Char counts would misalign these lines.
     let offsets: Vec<usize> = tree
         .lines()
         .filter(|l| l.contains('[') && l.contains("%)"))
         .map(|l| {
             let byte_idx = l.find('[').expect("bar bracket");
-            l[..byte_idx].chars().count()
+            display_width(&l[..byte_idx])
         })
         .collect();
     assert_eq!(offsets.len(), 4, "all four entries rendered:\n{tree}");
     let all_same = offsets.iter().all(|o| *o == offsets[0]);
     assert!(all_same, "misaligned bar columns at {offsets:?}:\n{tree}");
+
+    // The width estimator itself: wide chars count double, combining marks
+    // and zero-width joiners count for nothing.
+    assert_eq!(display_width("ascii"), 5);
+    assert_eq!(display_width("日本"), 4);
+    assert_eq!(display_width("🚀"), 2);
+    assert_eq!(display_width("e\u{301}"), 1); // e + combining acute
+}
+
+#[test]
+fn display_width_matches_char_count_only_for_ascii() {
+    use diskpulse::ui::display_width;
+
+    // Guards the discriminator: these names have MORE cells than chars,
+    // so the old chars().count() padding could never have aligned them.
+    let name = "📁_test_文件_🚀.txt";
+    assert!(
+        display_width(name) > name.chars().count(),
+        "test fixture lost its wide characters"
+    );
 }

@@ -478,3 +478,71 @@ fn clean_custom_path_respects_min_size_and_age_for_files() {
     assert!(!old_big.exists());
     assert!(new_small.exists(), "new_small.bin was touched");
 }
+
+// ---------------------------------------------------------------------------
+// Age windows never vouch for directory contents
+// ---------------------------------------------------------------------------
+
+#[test]
+fn older_than_never_deletes_fresh_files_inside_old_directories() {
+    use filetime::{set_file_mtime, FileTime};
+
+    let guard = TempDir::new().expect("tempdir");
+    let old_pkg = guard.path().join("old_pkg");
+    fs::create_dir_all(&old_pkg).expect("mkdir");
+    let old_sub = old_pkg.join("sub");
+    fs::create_dir_all(&old_sub).expect("mkdir");
+
+    let old_file = old_pkg.join("ancient.bin");
+    fs::write(&old_file, vec![b'o'; 2_048]).expect("write");
+    // In-place "rewrite" of an existing file: parent mtime stays untouched.
+    let rewritten = old_pkg.join("rewritten.log");
+    fs::write(&rewritten, vec![b'r'; 1_024]).expect("write");
+    // Fresh file two levels down: only `old_sub`'s own mtime moves.
+    let nested_fresh = old_sub.join("just_created.tmp");
+    fs::write(&nested_fresh, vec![b'n'; 512]).expect("write");
+
+    let month_ago = FileTime::from_unix_time(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64
+            - 30 * 24 * 3600,
+        0,
+    );
+    set_file_mtime(&old_pkg, month_ago).expect("backdate dir");
+    set_file_mtime(&old_sub, month_ago).expect("backdate subdir");
+    set_file_mtime(&old_file, month_ago).expect("backdate file");
+    // `rewritten` keeps its CURRENT mtime: an in-place rewrite refreshes the
+    // file itself while leaving every ancestor directory untouched.
+
+    let options = CleanOptions {
+        custom_path: Some(old_pkg.clone()),
+        older_than: Some(chrono::Duration::hours(1)),
+        apply: true,
+        yes: true,
+        ..CleanOptions::default()
+    };
+
+    let plan = create_clean_plan(&options).expect("plan");
+    let planned: Vec<_> = plan.items.iter().map(|item| item.path.clone()).collect();
+
+    assert!(
+        planned.contains(&old_file),
+        "genuinely ancient file must be selected: {planned:?}"
+    );
+    assert!(
+        !planned.iter().any(|p| *p == old_pkg || *p == old_sub),
+        "directories must never be whole units under an age window: {planned:?}"
+    );
+
+    let report = execute_clean_plan(&plan, false).expect("execute");
+    assert_eq!(report.errors_count, 0);
+    assert!(!old_file.exists(), "ancient file deleted");
+    assert!(rewritten.exists(), "fresh rewrite survived");
+    assert!(nested_fresh.exists(), "fresh nested file survived");
+    assert!(
+        old_sub.is_dir(),
+        "parent dirs remain after file-level clean"
+    );
+}

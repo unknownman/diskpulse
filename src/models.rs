@@ -145,10 +145,15 @@ impl DirectoryNode {
     }
 
     /// Clear all children at depth `max_depth` and beyond.
-    /// The root sits at `current_depth == 0`.
+    /// The root sits at `current_depth == 0`. Nodes cut at the boundary also
+    /// drop their pruned-sibling tallies: with no children rendered there is
+    /// nothing for a hidden-items summary row to stand beside, and keeping
+    /// the numbers would emit orphan rows below the visible cutoff.
     pub fn truncate_depth(&mut self, current_depth: usize, max_depth: usize) {
         if current_depth >= max_depth {
             self.children.clear();
+            self.pruned_entries = 0;
+            self.pruned_size = 0;
             return;
         }
         for child in &mut self.children {
@@ -572,6 +577,26 @@ mod tests {
 
         assert_eq!(root.children.len(), 2);
         assert!(root.children.iter().all(|c| c.children.is_empty()));
+    }
+
+    #[test]
+    fn truncate_depth_drops_orphan_pruned_tallies_at_cutoff() {
+        let mut root = dir_node("root");
+        let mut leaf = dir_node("leaf");
+        leaf.add_child(file_node("inner", 1, 1));
+        // Simulate a prior --top pass on the leaf level.
+        leaf.pruned_entries = 4;
+        leaf.pruned_size = 400;
+        root.add_child(leaf);
+
+        root.truncate_depth(0, 1);
+
+        assert!(root.children[0].children.is_empty());
+        assert_eq!(
+            root.children[0].pruned_entries, 0,
+            "orphan summary rows must not survive the cutoff"
+        );
+        assert_eq!(root.children[0].pruned_size, 0);
     }
 
     #[test]

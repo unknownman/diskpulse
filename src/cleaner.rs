@@ -643,9 +643,9 @@ fn resolve_targets(requested: &[String]) -> Result<Vec<CleanTargetDef>, DiskPuls
 ///   (never through symlinks), keeping plans compact even for huge caches.
 /// - A root that is itself a file or symlink is treated as a single unit,
 ///   so `clean --path <file>` works.
-/// - When an age window is active, a directory that is too fresh is not
-///   dropped wholesale (a directory's mtime only tracks its immediate
-///   entries): planning descends and judges its contents individually.
+/// - When an age window is active, directories are never deletion units:
+///   their mtimes cannot vouch for nested content, so planning always
+///   descends and judges files and links individually.
 fn collect_root_items(
     root: &Path,
     target_id: &str,
@@ -757,27 +757,23 @@ fn collect_entry(
 
     let modified = meta.modified();
 
+    // Age windows NEVER trust directory mtimes for wholesale removal. A dir
+    // mtime only tracks its immediate entries: in-place rewrites of files
+    // inside it do not bump it at all, and fresh grandchildren two levels
+    // down move only the immediate parent. An ancient-looking directory can
+    // therefore hide brand-new content, and `remove_dir_all` on it would
+    // destroy that content. Under a cutoff every directory expands into
+    // individually-judged children instead of becoming one unit.
+    if cutoff.is_some() && is_dir {
+        collect_from_dir(&path, meta, target_id, target_name, options, cutoff, out);
+        return;
+    }
+
     if let Some(cutoff) = cutoff {
+        // Files and links failing the window are dropped outright.
         match modified {
             Ok(mtime) if mtime <= cutoff => {}
-            _ => {
-                // Too fresh for the requested window (or unreadable mtime).
-                // Directories can legitimately hold ancient content under a
-                // recent mtime, so descend and judge their contents
-                // individually instead of discarding the subtree wholesale.
-                if is_dir {
-                    collect_from_dir(
-                        &path,
-                        meta,
-                        target_id,
-                        target_name,
-                        options,
-                        Some(cutoff),
-                        out,
-                    );
-                }
-                return;
-            }
+            _ => return,
         }
     }
 
@@ -900,21 +896,34 @@ pub fn execute_clean_plan(
     })
 }
 
-/// Remove a single planned item. The safety jail is re-verified immediately
-/// before mutation (defense against TOCTOU between planning and execution).
+/// Remove a single planned item.
+///
+/// Jail verification matches the location the mutation will REALLY touch:
+/// - Symlink items are unlinked in place, so the lexical location of the
+///   link itself is what matters.
+/// - Real files and directories mutate through any symlinked parent chain,
+///   so the canonicalized path decides. `/tmp/sandbox/link_to_usr/file`
+///   therefore fails the jail even though its lexical spelling looks tame.
 fn remove_item(
     path: &Path,
     is_dir: bool,
     use_trash: bool,
 ) -> std::result::Result<CleanItemStatus, String> {
-    if let Err(safety) = ensure_safe_location(&lexical_normalize(path)) {
-        return Err(format!("blocked by safety jail: {safety}"));
-    }
-
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) => return Err(deletion_failed(path, err)),
     };
+
+    let jail_target: PathBuf = if meta.file_type().is_symlink() {
+        lexical_normalize(path)
+    } else {
+        // The entry exists, so canonicalization normally succeeds; the
+        // lexical fallback covers races where it vanishes mid-check.
+        fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+    };
+    if let Err(safety) = ensure_safe_location(&jail_target) {
+        return Err(format!("blocked by safety jail: {safety}"));
+    }
 
     if use_trash {
         return trash::delete(path)
@@ -972,6 +981,38 @@ fn deletion_failed(path: &Path, source: std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_item_refuses_real_paths_behind_symlinked_parents() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        // Positive control: a plain file inside the cleanable temp tree is
+        // still deletable after the canonicalization change.
+        let plain = tmp.path().join("plain.bin");
+        fs::write(&plain, b"x").expect("write");
+        assert!(matches!(
+            remove_item(&plain, false, false),
+            Ok(CleanItemStatus::Deleted)
+        ));
+
+        // Escape attempt: a symlinked parent pointing at "/" drags the real
+        // mutation target into /etc. The lexical spelling looks tame; only
+        // the canonical view reveals the protected location.
+        let link = tmp.path().join("to_root");
+        std::os::unix::fs::symlink("/", &link).expect("symlink");
+        let via_link = link.join("etc/hosts");
+
+        let result = remove_item(&via_link, false, false);
+        assert!(
+            result.is_err(),
+            "deletion through symlinked parent must be refused"
+        );
+        assert!(
+            Path::new("/etc/hosts").exists(),
+            "the system file behind the link must survive"
+        );
+    }
 
     #[test]
     fn jail_blocks_parentless_drive_and_filesystem_roots() {

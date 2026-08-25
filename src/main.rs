@@ -146,7 +146,16 @@ fn cmd_clean(args: &CleanArgs, cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    if !options.yes && plan.total_items > 0 {
+    // Nothing planned: no prompt, no execution, no empty report table.
+    // The plan render above already carries the "nothing to do" notice.
+    if plan.total_items == 0 {
+        if cli.json {
+            return ui::render_clean_plan_json(&plan);
+        }
+        return Ok(());
+    }
+
+    if !options.yes {
         if !stdin_is_interactive() {
             // Piped/EOF stdin cannot answer a prompt: treat as a clean abort.
             println!("Operation cancelled by user.");

@@ -367,7 +367,7 @@ fn append_children(
     palette: &Palette,
 ) {
     let children = &node.children;
-    let Some(name_width) = children.iter().map(|c| c.name.chars().count()).max() else {
+    let Some(name_width) = children.iter().map(|c| display_width(&c.name)).max() else {
         // Nothing visible, but filters may still have hidden entries here.
         if node.pruned_entries > 0 {
             push_pruned_summary_row(out, node, prefix, palette);
@@ -464,14 +464,25 @@ fn append_entry(
     out.push('\n');
 }
 
-/// Left-pad `text` with trailing spaces to `width` characters, aligning the
-/// bar column across siblings.
+/// Visual terminal width of `text` in monospace cells.
+///
+/// Emojis and CJK/fullwidth blocks occupy two cells, combining marks and
+/// zero-width characters occupy none — plain char counts misalign columns
+/// for exactly those names. Delegates to the `unicode-width` tables.
+#[must_use]
+pub fn display_width(text: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    text.width()
+}
+
+/// Left-pad `text` with trailing spaces to `width` display cells, aligning
+/// the bar column across siblings regardless of wide characters in names.
 fn pad_right(text: &str, width: usize) -> String {
-    let visible = text.chars().count();
+    let visible = display_width(text);
     if visible >= width {
         text.to_owned()
     } else {
-        let mut padded = String::with_capacity(width);
+        let mut padded = String::with_capacity(text.len() + (width - visible));
         padded.push_str(text);
         padded.push_str(&" ".repeat(width - visible));
         padded
