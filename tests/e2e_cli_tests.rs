@@ -529,55 +529,40 @@ fn e2e_viz_top_n_shows_pruned_summary() {
 #[cfg(unix)]
 #[test]
 fn poisoned_tmpdir_cannot_bypass_the_jail() {
-    // ~/Documents is ProtectedUserData. Before sanitization, TMPDIR=/
-    // made every absolute path "under temp", so the carve-out ran first
-    // and this deletion would have been allowed.
-    let docs = PathBuf::from(std::env::var("HOME").expect("HOME")).join("Documents");
-    fs::create_dir_all(&docs).expect("Documents dir");
-    let victim = docs.join("diskpulse-poison-victim.bin");
+    // A hostile temp env must never weaken the jail. The target is the
+    // home root: protected on EVERY platform unconditionally (unlike
+    // ~/Documents, which bare Linux CI runners do not expose via
+    // xdg-user-dirs). Before prefix sanitization, TMPDIR=/ made every
+    // absolute path "under temp", so the carve-out ran first and this
+    // deletion would have been allowed.
+    let home = std::env::var("HOME").expect("HOME");
 
-    let poisoned = |victim_path: &PathBuf| {
-        fs::write(victim_path, b"keep").expect("write victim");
-        Command::new(bin())
-            .args([
-                "clean",
-                "--path",
-                docs.to_str().unwrap(),
-                "--apply",
-                "--yes",
-            ])
-            .env("TMPDIR", "/")
-            .env("TMP", "/")
-            .env("TEMP", "/")
-            .stdin(Stdio::null())
-            .output()
-            .expect("spawn diskpulse")
+    let spawn = |poisoned: bool| {
+        let mut cmd = Command::new(bin());
+        cmd.args(["clean", "--path", &home, "--apply", "--yes"])
+            .stdin(Stdio::null());
+        if poisoned {
+            cmd.envs([("TMPDIR", "/"), ("TMP", "/"), ("TEMP", "/")]);
+        }
+        cmd.output().expect("spawn diskpulse")
     };
 
-    // Poisoned run: jail must refuse, victim must survive.
-    let out = poisoned(&victim);
-    assert_ne!(out.status.code(), Some(0), "poisoned env wiped the jail");
+    let poisoned_run = spawn(true);
+    assert_ne!(
+        poisoned_run.status.code(),
+        Some(0),
+        "poisoned env wiped the jail\nstderr: {}",
+        String::from_utf8_lossy(&poisoned_run.stderr)
+    );
     assert!(
-        victim.exists(),
-        "protected file deleted under poisoned TMPDIR"
+        String::from_utf8_lossy(&poisoned_run.stderr).contains("home directory root"),
+        "refusal must be jail-based: {}",
+        String::from_utf8_lossy(&poisoned_run.stderr)
     );
 
-    // Control without poison variables: still refused for the same reason
-    // (ProtectedUserData), proving the refusal is jail logic, not an env
-    // parsing artifact.
-    fs::write(&victim, b"keep").expect("rewrite victim");
-    let out = Command::new(bin())
-        .args([
-            "clean",
-            "--path",
-            docs.to_str().unwrap(),
-            "--apply",
-            "--yes",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .expect("spawn diskpulse");
-    assert_ne!(out.status.code(), Some(0));
-    assert!(victim.exists());
-    let _ = fs::remove_file(&victim);
+    // Control without poison variables: refused for the same jail reason,
+    // proving the refusal is not an env-parsing artifact.
+    let plain_run = spawn(false);
+    assert_ne!(plain_run.status.code(), Some(0));
+    assert!(std::path::Path::new(&home).exists(), "home root vanished");
 }

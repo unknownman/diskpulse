@@ -1201,11 +1201,19 @@ mod tests {
 
     #[test]
     fn lexical_normalize_resolves_dots_without_fs() {
+        // Compare via component collections, not hardcoded separators:
+        // on Windows the same input normalizes to `\tmp\a\c`.
         let normalized = lexical_normalize(Path::new("/tmp/a/./b/../c"));
-        assert_eq!(normalized, PathBuf::from("/tmp/a/c"));
+        assert_eq!(
+            normalized.components().collect::<PathBuf>(),
+            Path::new("/tmp/a/c").components().collect::<PathBuf>()
+        );
 
         let above_root = lexical_normalize(Path::new("/../.."));
-        assert_eq!(above_root, PathBuf::from("/"));
+        assert_eq!(
+            above_root.components().collect::<PathBuf>(),
+            Path::new("/").components().collect::<PathBuf>()
+        );
 
         let absolute = lexical_normalize(Path::new("relative/x"));
         assert!(absolute.is_absolute());
