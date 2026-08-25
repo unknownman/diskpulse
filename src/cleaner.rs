@@ -282,9 +282,14 @@ pub fn get_registered_targets() -> Vec<CleanTargetDef> {
                 {
                     let lad = local_app_data();
                     vec![
-                        lad.clone()
-                            .map(|base| base.join("Google\\Chrome\\User Data\\Default\\Cache")),
-                        lad.map(|base| base.join("Mozilla\\Firefox")),
+                        lad.clone().map(|base| {
+                            base.join("Google")
+                                .join("Chrome")
+                                .join("User Data")
+                                .join("Default")
+                                .join("Cache")
+                        }),
+                        lad.map(|base| base.join("Mozilla").join("Firefox")),
                     ]
                 }
             },
@@ -581,9 +586,15 @@ fn resolve_targets(requested: &[String]) -> Result<Vec<CleanTargetDef>, DiskPuls
 
 /// Enumerate the direct children of one target root as candidate items.
 ///
-/// Granularity note: each child becomes ONE removal unit — directories are
-/// measured recursively here but deleted as whole subtrees at execution time
-/// (never through symlinks). This keeps plans compact even for huge caches.
+/// Granularity notes:
+/// - Each child becomes ONE removal unit — directories are measured
+///   recursively here but deleted as whole subtrees at execution time
+///   (never through symlinks), keeping plans compact even for huge caches.
+/// - A root that is itself a file or symlink is treated as a single unit,
+///   so `clean --path <file>` works.
+/// - When an age window is active, a directory that is too fresh is not
+///   dropped wholesale (a directory's mtime only tracks its immediate
+///   entries): planning descends and judges its contents individually.
 fn collect_root_items(
     root: &Path,
     target_id: &str,
@@ -596,74 +607,151 @@ fn collect_root_items(
         Ok(meta) => meta,
         Err(_) => return Vec::new(),
     };
-    let root_dev = util::device_id(&root_meta);
 
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
-    };
+    // Single-file / symlink roots are deletion units themselves.
+    if !root_meta.is_dir() {
+        let mut out = Vec::new();
+        collect_entry(
+            root.to_path_buf(),
+            &root_meta,
+            target_id,
+            target_name,
+            options,
+            cutoff,
+            None,
+            &mut out,
+        );
+        return out;
+    }
 
     let mut items = Vec::new();
+    collect_from_dir(
+        root,
+        &root_meta,
+        target_id,
+        target_name,
+        options,
+        cutoff,
+        &mut items,
+    );
+    items
+}
+
+/// Enumerate one directory level into `out`.
+fn collect_from_dir(
+    dir: &Path,
+    dir_meta: &std::fs::Metadata,
+    target_id: &str,
+    target_name: &str,
+    options: &CleanOptions,
+    cutoff: Option<SystemTime>,
+    out: &mut Vec<CleanItem>,
+) {
+    let parent_dev = util::device_id(dir_meta);
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
     for entry in entries.flatten() {
         let path = entry.path();
-        // DirEntry::metadata never follows symlinks: quarantine holds at
-        // planning time just as it does at execution time.
+        // DirEntry::metadata never follows symlinks.
         let meta = match entry.metadata() {
             Ok(meta) => meta,
             Err(_) => continue,
         };
-        let file_type = meta.file_type();
-        // Symlinks ARE valid deletion units — the link itself gets unlinked,
-        // never followed. `is_dir` stays false for them so execution removes
-        // just the link, leaving the target's contents untouched.
-        let is_symlink = file_type.is_symlink();
-        let is_dir = file_type.is_dir() && !is_symlink;
-
-        if is_dir && options.one_file_system {
-            // Unknown device ids on either side mean "cannot prove a boundary"
-            // — stay conservative and keep traversing.
-            if let (Some(item_dev), Some(root_id)) = (util::device_id(&meta), root_dev) {
-                if item_dev != root_id {
-                    continue;
-                }
-            }
-        }
-
-        let size = if is_dir {
-            tree_size(&path)
-        } else {
-            // Links report their own metadata, never the target's.
-            util::physical_disk_size(&meta)
-        };
-
-        let modified = meta.modified();
-        if let Some(cutoff) = cutoff {
-            // Entries with an unreadable mtime are skipped defensively when
-            // an age window is requested.
-            match modified {
-                Ok(mtime) if mtime <= cutoff => {}
-                _ => continue,
-            }
-        }
-        if let Some(min_size) = options.min_size {
-            if size < min_size {
-                continue;
-            }
-        }
-        if validate_path_safety(&path).is_err() {
-            continue;
-        }
-
-        items.push(CleanItem {
+        collect_entry(
             path,
-            size,
-            target_id: target_id.to_owned(),
-            target_name: target_name.to_owned(),
-            is_dir,
-            modified: modified.ok().map(DateTime::<Utc>::from),
-        });
+            &meta,
+            target_id,
+            target_name,
+            options,
+            cutoff,
+            parent_dev,
+            out,
+        );
     }
-    items
+}
+
+/// Apply every filter to one candidate and either emit it, descend into it,
+/// or discard it.
+#[allow(clippy::too_many_arguments)]
+fn collect_entry(
+    path: PathBuf,
+    meta: &std::fs::Metadata,
+    target_id: &str,
+    target_name: &str,
+    options: &CleanOptions,
+    cutoff: Option<SystemTime>,
+    parent_dev: Option<u64>,
+    out: &mut Vec<CleanItem>,
+) {
+    let file_type = meta.file_type();
+    // Symlinks ARE valid deletion units — the link itself gets unlinked,
+    // never followed. `is_dir` stays false for them so execution removes
+    // just the link, leaving the target's contents untouched.
+    let is_symlink = file_type.is_symlink();
+    let is_dir = file_type.is_dir() && !is_symlink;
+
+    if is_dir && options.one_file_system {
+        // Unknown device ids on either side mean "cannot prove a boundary"
+        // — stay conservative and keep traversing.
+        if let (Some(item_dev), Some(root_id)) = (util::device_id(meta), parent_dev) {
+            if item_dev != root_id {
+                return;
+            }
+        }
+    }
+
+    let modified = meta.modified();
+
+    if let Some(cutoff) = cutoff {
+        match modified {
+            Ok(mtime) if mtime <= cutoff => {}
+            _ => {
+                // Too fresh for the requested window (or unreadable mtime).
+                // Directories can legitimately hold ancient content under a
+                // recent mtime, so descend and judge their contents
+                // individually instead of discarding the subtree wholesale.
+                if is_dir {
+                    collect_from_dir(
+                        &path,
+                        meta,
+                        target_id,
+                        target_name,
+                        options,
+                        Some(cutoff),
+                        out,
+                    );
+                }
+                return;
+            }
+        }
+    }
+
+    let size = if is_dir {
+        tree_size(&path)
+    } else {
+        // Links report their own metadata, never the target's.
+        util::physical_disk_size(meta)
+    };
+
+    if let Some(min_size) = options.min_size {
+        if size < min_size {
+            return;
+        }
+    }
+    if validate_path_safety(&path).is_err() {
+        return;
+    }
+
+    out.push(CleanItem {
+        path,
+        size,
+        target_id: target_id.to_owned(),
+        target_name: target_name.to_owned(),
+        is_dir,
+        modified: modified.ok().map(DateTime::<Utc>::from),
+    });
 }
 
 fn effective_cutoff(age: Option<Duration>) -> Option<SystemTime> {

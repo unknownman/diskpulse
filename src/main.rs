@@ -138,7 +138,7 @@ fn cmd_clean(args: &CleanArgs, cli: &Cli) -> Result<()> {
     }
 
     if !cli.quiet && !cli.json {
-        ui::render_clean_plan_table(&plan, options.apply)?;
+        ui::render_clean_plan_table(&plan, options.apply, options.use_trash)?;
     }
 
     if !options.apply {
@@ -152,10 +152,7 @@ fn cmd_clean(args: &CleanArgs, cli: &Cli) -> Result<()> {
             return Ok(());
         }
         let confirmed = dialoguer::Confirm::new()
-            .with_prompt(format!(
-                "Permanently delete {} items of cached data?",
-                plan.total_items
-            ))
+            .with_prompt(ui::confirmation_prompt(plan.total_items, options.use_trash))
             .default(false)
             .interact()?;
         if !confirmed {

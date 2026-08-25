@@ -138,3 +138,180 @@ fn viz_json_is_well_formed_and_complete() {
     assert_eq!(children[1]["name"], "README.md");
     assert_eq!(children[1]["is_dir"], serde_json::json!(false));
 }
+
+#[test]
+fn confirmation_and_banner_wording_tracks_trash_mode() {
+    use diskpulse::ui::{apply_warning, confirmation_prompt};
+
+    assert_eq!(
+        confirmation_prompt(7, false),
+        "Permanently delete 7 items of cached data?"
+    );
+    assert_eq!(
+        confirmation_prompt(7, true),
+        "Move 7 items of cached data to the trash/recycle bin?"
+    );
+
+    assert_eq!(
+        apply_warning("21.05 MB", "420", false),
+        "Applying will permanently delete 21.05 MB across 420 items."
+    );
+    assert_eq!(
+        apply_warning("21.05 MB", "420", true),
+        "Applying will move 21.05 MB across 420 items to the trash."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Aggregated pruned summary rows (--top / --min-size)
+// ---------------------------------------------------------------------------
+
+/// project/            --top 2
+/// ├── 📁 big-a/
+/// │   └── payload.bin
+/// ├── 📁 big-b/
+/// │   └── payload.bin
+/// └── ⋯ and 3 other items (36.00 KB total)
+fn five_dir_fixture() -> ScanResult {
+    let mut root = dir("project");
+    for (name, size) in [
+        ("big-a", 20_480_u64),
+        ("big-b", 16_384),
+        ("mid-c", 12_288),
+        ("mid-d", 8_192),
+        ("tiny-e", 4_096),
+    ] {
+        let mut d = dir(name);
+        d.add_child(file("payload.bin", size));
+        root.add_child(d);
+    }
+    ScanResult {
+        summary: ScanSummary {
+            root_path: PathBuf::from("/tmp/project"),
+            total_size: root.size,
+            total_apparent_size: root.apparent_size,
+            total_files: root.file_count,
+            total_dirs: root.dir_count,
+            duration_ms: 3,
+            errors_count: 0,
+        },
+        root,
+    }
+}
+
+#[test]
+fn truncated_levels_render_aggregated_pruned_row() {
+    let mut result = five_dir_fixture();
+    result.root.sort_by_size_descending();
+    result.root.retain_top_n(2);
+
+    let tree = format_viz_tree(&result, &opts(), true);
+
+    assert!(
+        tree.contains("⋯ and 3 other items ("),
+        "missing summary row:\n{tree}"
+    );
+    assert!(tree.contains("(24.00 KB total)"), "\n{tree}");
+
+    // Glyph balance: visible siblings keep ├; only the summary closes with └.
+    for name in ["big-a", "big-b"] {
+        let line = tree.lines().find(|l| l.contains(name)).unwrap();
+        assert!(
+            line.contains("├── "),
+            "{name} should not be visually last:\n{line:?}"
+        );
+    }
+    let summary = tree
+        .lines()
+        .find(|l| l.contains("other items"))
+        .expect("summary line");
+    assert!(
+        summary.starts_with("└── ⋯"),
+        "summary row must close the level:\n{summary:?}"
+    );
+
+    // The last VISIBLE child is a directory: its rail must continue down to
+    // the summary row instead of terminating early.
+    let payload_line = tree.lines().find(|l| l.contains("payload.bin")).unwrap();
+    assert!(
+        payload_line.starts_with("│   "),
+        "subtree of last visible dir must stay connected to the summary row:\n{payload_line:?}"
+    );
+}
+
+#[test]
+fn min_size_filtered_levels_render_pruned_row() {
+    let mut result = fixture();
+    result.root.filter_min_size(3_000);
+
+    let tree = format_viz_tree(&result, &opts(), true);
+
+    // README.md (2048) was dropped from the root level.
+    assert!(
+        tree.contains("⋯ and 1 other item (2.00 KB total)"),
+        "singular wording expected:\n{tree}"
+    );
+    assert!(!tree.contains("README.md"), "\n{tree}");
+    // src survives; totals remain truthful.
+    assert!(tree.contains("📁 src"));
+    assert!(tree.contains("Total: 8.00 KB"));
+}
+
+#[test]
+fn fully_filtered_level_still_renders_summary_row() {
+    let mut result = fixture();
+    result.root.children[1].children.clear(); // assets emptied first
+    result.root.filter_min_size(10_000);
+
+    // Every entry below root is gone; the row still explains where bytes went.
+    let tree = format_viz_tree(&result, &opts(), true);
+    assert!(
+        tree.contains("└── ⋯ and"),
+        "expected a lone summary row under root:\n{tree}"
+    );
+}
+
+#[test]
+fn wide_unicode_names_keep_bar_column_aligned() {
+    let mut root = dir("project");
+    for (name, size) in [
+        ("ascii.txt", 5_000),
+        ("日本語のファイル.txt", 4_000),
+        ("🚀emoji-name.bin", 3_000),
+        ("микро-файл.dat", 2_000),
+    ] {
+        root.add_child(file(name, size));
+    }
+
+    let tree = format_viz_tree(
+        &ScanResult {
+            summary: ScanSummary {
+                root_path: PathBuf::from("/tmp/project"),
+                total_size: root.size,
+                total_apparent_size: root.apparent_size,
+                total_files: root.file_count,
+                total_dirs: root.dir_count,
+                duration_ms: 1,
+                errors_count: 0,
+            },
+            root,
+        },
+        &opts(),
+        true,
+    );
+
+    // Every entry's proportional bar must start at the same CHARACTER offset
+    // (the project's alignment standard: visible char counts, not bytes or
+    // terminal cells).
+    let offsets: Vec<usize> = tree
+        .lines()
+        .filter(|l| l.contains('[') && l.contains("%)"))
+        .map(|l| {
+            let byte_idx = l.find('[').expect("bar bracket");
+            l[..byte_idx].chars().count()
+        })
+        .collect();
+    assert_eq!(offsets.len(), 4, "all four entries rendered:\n{tree}");
+    let all_same = offsets.iter().all(|o| *o == offsets[0]);
+    assert!(all_same, "misaligned bar columns at {offsets:?}:\n{tree}");
+}

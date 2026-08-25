@@ -53,6 +53,14 @@ pub struct DirectoryNode {
     pub dir_count: u64,
     pub is_dir: bool,
     pub children: Vec<DirectoryNode>,
+    /// Siblings hidden at this level by display filters (`--top`, `--min-size`),
+    /// counted as direct-child units. Purely presentational: excluded from
+    /// every size/count aggregate above.
+    #[serde(default)]
+    pub pruned_entries: u64,
+    /// Accumulated size of those hidden siblings.
+    #[serde(default)]
+    pub pruned_size: u64,
 }
 
 impl DirectoryNode {
@@ -68,6 +76,8 @@ impl DirectoryNode {
             dir_count: 0,
             is_dir,
             children: Vec::new(),
+            pruned_entries: 0,
+            pruned_size: 0,
         }
     }
 
@@ -115,12 +125,23 @@ impl DirectoryNode {
     ///
     /// Ancestor aggregates intentionally remain untouched: they continue to
     /// report the true totals of the underlying tree, mirroring `du -t`
-    /// semantics where hidden entries still count toward parents.
+    /// semantics where hidden entries still count toward parents. Dropped
+    /// children are tallied in `pruned_entries`/`pruned_size` so renderers
+    /// can surface an aggregated "hidden items" row.
     pub fn filter_min_size(&mut self, min_size: u64) {
         for child in &mut self.children {
             child.filter_min_size(min_size);
         }
-        self.children.retain(|child| child.size >= min_size);
+        let mut kept = Vec::with_capacity(self.children.len());
+        for child in self.children.drain(..) {
+            if child.size >= min_size {
+                kept.push(child);
+            } else {
+                self.pruned_entries += 1;
+                self.pruned_size += child.size;
+            }
+        }
+        self.children = kept;
     }
 
     /// Clear all children at depth `max_depth` and beyond.
@@ -137,8 +158,13 @@ impl DirectoryNode {
 
     /// Keep only the first `n` children at every level, following each
     /// level's current order (pair with a `sort_by_*` call for "top N").
+    /// Dropped children are tallied in `pruned_entries`/`pruned_size`.
     pub fn retain_top_n(&mut self, n: usize) {
-        self.children.truncate(n);
+        if self.children.len() > n {
+            let dropped = self.children.split_off(n);
+            self.pruned_entries += dropped.len() as u64;
+            self.pruned_size += dropped.iter().map(|child| child.size).sum::<u64>();
+        }
         for child in &mut self.children {
             child.retain_top_n(n);
         }
@@ -467,6 +493,46 @@ mod tests {
         assert_eq!(kept.children.len(), 2);
         assert_eq!(kept.size, kept_size_before);
         assert_eq!(kept.children[0].name, "k1");
+    }
+
+    #[test]
+    fn retain_top_n_tallies_hidden_siblings_per_level() {
+        let mut inner = dir_node("inner");
+        for i in 0..4 {
+            inner.add_child(file_node(&format!("f{i}"), 10, 10));
+        }
+
+        let mut root = dir_node("root");
+        root.add_child(inner);
+        root.add_child(file_node("a", 100, 100));
+        root.add_child(file_node("b", 90, 90));
+        root.add_child(file_node("c", 80, 80));
+
+        root.retain_top_n(2);
+
+        // Root level: 4 children -> 2 kept, 2 dropped.
+        assert_eq!(root.pruned_entries, 2);
+        assert_eq!(root.pruned_size, 80 + 90);
+        // Inner level: 4 files -> top 2 kept, independent tally.
+        let inner = &root.children[0];
+        assert_eq!(inner.pruned_entries, 2);
+        assert_eq!(inner.pruned_size, 20);
+        // Aggregates stay untouched by display filtering.
+        assert_eq!(root.size, 310);
+    }
+
+    #[test]
+    fn filter_min_size_tallies_dropped_entries() {
+        let mut root = dir_node("root");
+        root.add_child(file_node("big", 500, 500));
+        root.add_child(file_node("dust1", 5, 5));
+        root.add_child(file_node("dust2", 7, 7));
+
+        root.filter_min_size(100);
+
+        assert_eq!(root.pruned_entries, 2);
+        assert_eq!(root.pruned_size, 12);
+        assert_eq!(root.size, 512, "aggregates keep reporting truth");
     }
 
     #[test]

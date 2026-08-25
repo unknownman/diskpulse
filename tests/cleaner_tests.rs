@@ -230,6 +230,133 @@ fn size_filter_excludes_small_entries() {
 }
 
 // ---------------------------------------------------------------------------
+// Single-file custom paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn single_file_custom_path_is_planned_and_deleted() {
+    let guard = TempDir::new().expect("tempdir");
+    let file = guard.path().join("single.bin");
+    fs::write(&file, vec![b'z'; 4_096]).expect("write fixture");
+
+    let options = CleanOptions {
+        custom_path: Some(file.clone()),
+        apply: true,
+        yes: true,
+        ..CleanOptions::default()
+    };
+
+    let plan = create_clean_plan(&options).expect("plan");
+    assert_eq!(plan.total_items, 1, "the file itself is the only unit");
+    assert!(!plan.items[0].is_dir);
+    assert_eq!(plan.items[0].path, file);
+
+    let report = execute_clean_plan(&plan, false).expect("execute");
+    assert_eq!(report.items_freed, 1);
+    assert_eq!(report.errors_count, 0);
+    assert!(!file.exists(), "single-file target was not deleted");
+}
+
+#[test]
+fn single_file_custom_path_respects_dry_run_and_filters() {
+    let guard = TempDir::new().expect("tempdir");
+    let file = guard.path().join("keep-me.bin");
+    fs::write(&file, vec![b'z'; 4_096]).expect("write fixture");
+
+    // Dry-run never deletes it.
+    let dry = CleanOptions {
+        custom_path: Some(file.clone()),
+        ..CleanOptions::default()
+    };
+    let plan = create_clean_plan(&dry).expect("plan");
+    assert_eq!(plan.total_items, 1);
+    assert!(plan.is_dry_run);
+    assert!(file.exists());
+
+    // min_size below the file's size keeps it plannable; above excludes it.
+    let small = CleanOptions {
+        custom_path: Some(file.clone()),
+        min_size: Some(1_024),
+        ..CleanOptions::default()
+    };
+    assert_eq!(create_clean_plan(&small).unwrap().total_items, 1);
+
+    let big = CleanOptions {
+        custom_path: Some(file.clone()),
+        min_size: Some(1 << 20),
+        ..CleanOptions::default()
+    };
+    assert_eq!(
+        create_clean_plan(&big).unwrap().total_items,
+        0,
+        "file below --min-size must be filtered out"
+    );
+    assert!(file.exists(), "filtered file was touched");
+}
+
+// ---------------------------------------------------------------------------
+// Deep filter evaluation: fresh directory mtime hides nothing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn older_than_descends_into_recently_touched_directories() {
+    use filetime::{set_file_mtime, FileTime};
+
+    let (_guard, root) = sandbox_cache();
+
+    // A cache package whose DIRECTORY was touched recently but whose bulk
+    // content is ancient. The dir mtime is "now" because we just created it.
+    let pkg = root.join("fresh_pkg");
+    touch(&pkg.join("stale-1.bin"), 2_048);
+    touch(&pkg.join("stale-2.bin"), 2_048);
+    touch(&pkg.join("brand-new.bin"), 2_048);
+
+    let hours_ago = |secs: i64| {
+        FileTime::from_unix_time(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs() as i64
+                - secs,
+            0,
+        )
+    };
+    set_file_mtime(pkg.join("stale-1.bin"), hours_ago(4 * 3600)).expect("backdate");
+    set_file_mtime(pkg.join("stale-2.bin"), hours_ago(3 * 3600)).expect("backdate");
+
+    let options = CleanOptions {
+        custom_path: Some(root.clone()),
+        older_than: Some(chrono::Duration::hours(1)),
+        apply: true,
+        yes: true,
+        ..CleanOptions::default()
+    };
+
+    let plan = create_clean_plan(&options).expect("plan");
+    let planned: Vec<_> = plan.items.iter().map(|item| item.path.clone()).collect();
+
+    assert!(
+        planned.contains(&pkg.join("stale-1.bin")) && planned.contains(&pkg.join("stale-2.bin")),
+        "ancient files inside a freshly-touched dir were missed: {planned:?}"
+    );
+    assert!(
+        !planned.contains(&pkg),
+        "the whole fresh dir must not be planned as one unit"
+    );
+    assert!(
+        !planned.contains(&pkg.join("brand-new.bin")),
+        "fresh files inside the dir stay protected"
+    );
+
+    // Execute and verify exactly the two stale files are gone.
+    let report = execute_clean_plan(&plan, false).expect("execute");
+    assert_eq!(report.items_freed, 2);
+    assert!(!pkg.join("stale-1.bin").exists());
+    assert!(pkg.join("brand-new.bin").exists());
+    assert!(pkg.is_dir());
+}
+
+// ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
 
@@ -268,4 +395,86 @@ fn execute_plan_deletes_items_when_apply_is_set() {
     assert!(!root.join("pkg-a").exists());
     assert!(!root.join("loose.bin").exists());
     assert!(root.is_dir());
+}
+
+// ---------------------------------------------------------------------------
+// Requested edge-case matrix: single files + combined file-level filters
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clean_custom_path_single_file() {
+    let guard = TempDir::new().expect("tempdir");
+    let temp_file = guard.path().join("temp_file.bin");
+    // Block-aligned length (4 x 4 KiB) so allocated bytes equal logical
+    // length on every filesystem; bytes_freed reports disk allocation.
+    let payload = vec![b'A'; 16_384];
+    fs::write(&temp_file, &payload).expect("write fixture");
+    assert_eq!(fs::metadata(&temp_file).unwrap().len(), 16_384);
+
+    let options = CleanOptions {
+        custom_path: Some(temp_file.clone()),
+        apply: true,
+        yes: true,
+        ..CleanOptions::default()
+    };
+
+    let plan = create_clean_plan(&options).expect("plan must accept a bare file root");
+    assert_eq!(plan.total_items, 1);
+    assert!(!plan.items[0].is_dir);
+
+    let report = execute_clean_plan(&plan, false).expect("execute");
+
+    assert_eq!(report.bytes_freed, 16_384, "freed bytes == file length");
+    assert_eq!(report.items_freed, 1);
+    assert_eq!(report.errors_count, 0);
+    assert!(!temp_file.exists(), "temp_file.bin was not deleted");
+}
+
+#[test]
+fn clean_custom_path_respects_min_size_and_age_for_files() {
+    use filetime::{set_file_mtime, FileTime};
+
+    let guard = TempDir::new().expect("tempdir");
+    let old_big = guard.path().join("old_big.bin");
+    let new_small = guard.path().join("new_small.bin");
+    fs::write(&old_big, vec![b'o'; 8_192]).expect("write fixture");
+    fs::write(&new_small, vec![b'n'; 1_024]).expect("write fixture");
+
+    // Backdate old_big.bin well past the requested window.
+    let three_hours_ago = FileTime::from_unix_time(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64
+            - 3 * 3600,
+        0,
+    );
+    set_file_mtime(&old_big, three_hours_ago).expect("backdate mtime");
+
+    let options = CleanOptions {
+        custom_path: Some(guard.path().to_path_buf()),
+        older_than: Some(chrono::Duration::hours(1)),
+        min_size: Some(4_096),
+        apply: true,
+        yes: true,
+        ..CleanOptions::default()
+    };
+
+    let plan = create_clean_plan(&options).expect("plan");
+    let planned: Vec<_> = plan.items.iter().map(|item| item.path.clone()).collect();
+
+    assert_eq!(plan.total_items, 1, "exactly one survivor: {planned:?}");
+    assert!(
+        planned.contains(&old_big),
+        "old + big file must be selected: {planned:?}"
+    );
+    assert!(
+        !planned.contains(&new_small),
+        "fresh small file must stay protected: {planned:?}"
+    );
+
+    let report = execute_clean_plan(&plan, false).expect("execute");
+    assert_eq!(report.bytes_freed, 8_192);
+    assert!(!old_big.exists());
+    assert!(new_small.exists(), "new_small.bin was touched");
 }

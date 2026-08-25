@@ -189,7 +189,10 @@ pub fn thousands(value: u64) -> String {
     let len = raw.len();
     let mut grouped = String::with_capacity(raw.len() + raw.len() / 3);
     for (idx, digit) in raw.chars().enumerate() {
-        if idx > 0 && (len - idx).is_multiple_of(3) {
+        // Plain remainder arithmetic instead of `u64::is_multiple_of`, which
+        // only exists on newer toolchains; clippy's newer lint is silenced.
+        #[allow(clippy::manual_is_multiple_of)]
+        if idx > 0 && (len - idx) % 3 == 0 {
             grouped.push(',');
         }
         grouped.push(digit);
@@ -306,13 +309,7 @@ pub fn format_viz_tree(result: &ScanResult, options: &ScanOptions, no_color: boo
         palette.size(result.summary.total_apparent_size),
     ));
 
-    append_children(
-        &mut out,
-        &result.root.children,
-        result.root.size,
-        "",
-        &palette,
-    );
+    append_children(&mut out, &result.root, result.root.size, "", &palette);
 
     out.push_str(&palette.subtle(&"─".repeat(SEPARATOR_WIDTH)));
     out.push('\n');
@@ -356,22 +353,34 @@ fn sort_label(criterion: SortCriterion) -> &'static str {
     }
 }
 
-/// Recursively append `children` of one parent, drawing Unicode branch
+/// Recursively append the children of one parent node, drawing Unicode branch
 /// glyphs relative to `prefix` and sizing percentages against `parent_total`.
+///
+/// If the parent's display filters (`--top`, `--min-size`) hid any direct
+/// children, a subtle aggregated summary branch is appended after the visible
+/// ones so totals stay visually reconcilable.
 fn append_children(
     out: &mut String,
-    children: &[DirectoryNode],
+    node: &DirectoryNode,
     parent_total: u64,
     prefix: &str,
     palette: &Palette,
 ) {
+    let children = &node.children;
     let Some(name_width) = children.iter().map(|c| c.name.chars().count()).max() else {
+        // Nothing visible, but filters may still have hidden entries here.
+        if node.pruned_entries > 0 {
+            push_pruned_summary_row(out, node, prefix, palette);
+        }
         return;
     };
+    // When a summary row follows, no visible child is visually last: every
+    // glyph stays `├──` and nested rails keep `│   ` so the tree connects.
+    let has_summary_row = node.pruned_entries > 0;
     let last_idx = children.len() - 1;
 
     for (idx, child) in children.iter().enumerate() {
-        let is_last = idx == last_idx;
+        let is_last = idx == last_idx && !has_summary_row;
         out.push_str(prefix);
         out.push_str(if is_last { "└── " } else { "├── " });
         append_entry(out, child, parent_total, name_width, palette);
@@ -379,9 +388,38 @@ fn append_children(
         if child.is_dir {
             let mut nested_prefix = String::from(prefix);
             nested_prefix.push_str(if is_last { "    " } else { "│   " });
-            append_children(out, &child.children, child.size, &nested_prefix, palette);
+            append_children(out, child, child.size, &nested_prefix, palette);
         }
     }
+
+    if has_summary_row {
+        push_pruned_summary_row(out, node, prefix, palette);
+    }
+}
+
+/// Append the aggregated row standing in for entries hidden by display
+/// filters, e.g. `└── ⋯ and 8 other items (120.00 MB total)`.
+fn push_pruned_summary_row(
+    out: &mut String,
+    node: &DirectoryNode,
+    prefix: &str,
+    palette: &Palette,
+) {
+    let noun = if node.pruned_entries == 1 {
+        "item"
+    } else {
+        "items"
+    };
+    let text = format!(
+        "⋯ and {} other {} ({} total)",
+        thousands(node.pruned_entries),
+        noun,
+        size_label(node.pruned_size)
+    );
+    out.push_str(prefix);
+    out.push_str("└── ");
+    out.push_str(&palette.subtle(&text));
+    out.push('\n');
 }
 
 fn append_entry(
@@ -470,6 +508,26 @@ fn item_count_label(count: usize) -> String {
     )
 }
 
+/// Interactive confirmation prompt, phrased according to the deletion mode.
+pub fn confirmation_prompt(item_count: usize, use_trash: bool) -> String {
+    if use_trash {
+        format!("Move {item_count} items of cached data to the trash/recycle bin?")
+    } else {
+        format!("Permanently delete {item_count} items of cached data?")
+    }
+}
+
+/// Pre-execution banner body describing what applying will do.
+///
+/// `size_label`/`count_label` are pre-formatted (e.g. `"21.05 MB"`, `"420"`).
+pub fn apply_warning(size_label: &str, count_label: &str, use_trash: bool) -> String {
+    if use_trash {
+        format!("Applying will move {size_label} across {count_label} items to the trash.")
+    } else {
+        format!("Applying will permanently delete {size_label} across {count_label} items.")
+    }
+}
+
 fn status_cell(status: &CleanItemStatus) -> Cell {
     match status {
         CleanItemStatus::Deleted => Cell::new(status.to_string()).fg(Color::Green),
@@ -482,8 +540,9 @@ fn status_cell(status: &CleanItemStatus) -> Cell {
 /// Render the cleanup plan as a Unicode table.
 ///
 /// `is_apply` switches the footer between dry-run guidance and the
-/// pre-execution warning shown before interactive confirmation.
-pub fn render_clean_plan_table(plan: &CleanPlan, is_apply: bool) -> Result<()> {
+/// pre-execution warning shown before interactive confirmation; `use_trash`
+/// selects "move to trash" vs "permanently delete" phrasing.
+pub fn render_clean_plan_table(plan: &CleanPlan, is_apply: bool, use_trash: bool) -> Result<()> {
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
@@ -529,10 +588,12 @@ pub fn render_clean_plan_table(plan: &CleanPlan, is_apply: bool) -> Result<()> {
         println!(
             "{}",
             warning(&format!(
-                "⚠  Applying will {} {} across {} items. Confirmation required unless --yes.",
-                "permanently delete",
-                size_label(plan.total_bytes),
-                thousands(u64::try_from(plan.total_items).unwrap_or(u64::MAX)),
+                "⚠  {} Confirmation required unless --yes.",
+                apply_warning(
+                    &size_label(plan.total_bytes),
+                    &thousands(u64::try_from(plan.total_items).unwrap_or(u64::MAX)),
+                    use_trash
+                )
             ))
         );
     } else {

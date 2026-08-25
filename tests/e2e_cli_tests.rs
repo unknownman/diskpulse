@@ -353,3 +353,171 @@ fn quiet_suppresses_tables_but_not_exit_semantics() {
     assert_eq!(code(&out), 0);
     assert!(stdout_lossy(&out).trim().is_empty(), "quiet printed tables");
 }
+
+// ---------------------------------------------------------------------------
+// Single-file --path targets
+// ---------------------------------------------------------------------------
+
+#[test]
+fn single_file_custom_path_deletes_end_to_end() {
+    let guard = TempDir::new().expect("tempdir");
+    let file = guard.path().join("lonely.cache");
+    fs::write(&file, vec![b'q'; 4_096]).expect("write fixture");
+
+    // Dry-run first: file must survive.
+    let out = run(&["clean", "--path", file.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "stderr={}", stderr_lossy(&out));
+    assert!(file.exists(), "dry-run deleted the single-file target");
+
+    // Apply: file is gone.
+    let out = run(&[
+        "clean",
+        "--path",
+        file.to_str().unwrap(),
+        "--apply",
+        "--yes",
+    ]);
+    assert_eq!(code(&out), 0, "stderr={}", stderr_lossy(&out));
+    assert!(!file.exists(), "single-file target survived --apply");
+}
+
+// ---------------------------------------------------------------------------
+// Trash-aware messaging
+// ---------------------------------------------------------------------------
+
+#[test]
+fn apply_banner_uses_move_wording_with_trash_flag() {
+    let (_guard, root, dir_item, file_item) = mock_cache();
+
+    // stdin is not a tty -> prompt cancels cleanly after the banner printed.
+    let out = run(&[
+        "clean",
+        "--path",
+        root.to_str().unwrap(),
+        "--apply",
+        "--trash",
+    ]);
+    assert_eq!(code(&out), 0);
+
+    let stdout = stdout_lossy(&out);
+    assert!(
+        stdout.contains("Applying will move") && stdout.contains("to the trash"),
+        "trash banner wording missing:\n{stdout}"
+    );
+    assert!(
+        !stdout.to_lowercase().contains("permanently delete"),
+        "permanent wording leaked into trash mode:\n{stdout}"
+    );
+
+    // Cancelled before execution: nothing was moved or removed.
+    assert!(dir_item.exists());
+    assert!(file_item.exists());
+}
+
+#[test]
+fn apply_banner_keeps_permanent_wording_without_trash_flag() {
+    let (_guard, root, _dir, _file) = mock_cache();
+
+    let out = run(&["clean", "--path", root.to_str().unwrap(), "--apply"]);
+    assert_eq!(code(&out), 0);
+
+    let stdout = stdout_lossy(&out);
+    assert!(
+        stdout.contains("Applying will permanently delete"),
+        "permanent banner wording missing:\n{stdout}"
+    );
+    assert!(!stdout.contains("to the trash"));
+}
+
+// ---------------------------------------------------------------------------
+// Aggregated pruned summary rows (--top)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn viz_renders_pruned_summary_row_for_top_n() {
+    let guard = TempDir::new().expect("tempdir");
+    // Five sibling directories with distinct sizes; --top 2 keeps two.
+    for (name, blocks) in [
+        ("d-big-a", 5_u64),
+        ("d-big-b", 4),
+        ("d-mid-c", 3),
+        ("d-mid-d", 2),
+        ("d-tiny-e", 1),
+    ] {
+        let d = guard.path().join(name);
+        fs::create_dir_all(&d).expect("mkdir");
+        fs::write(d.join("payload.bin"), vec![b'x'; (blocks * 4096) as usize]).expect("write");
+    }
+
+    let out = run(&["viz", guard.path().to_str().unwrap(), "--top", "2"]);
+    assert_eq!(code(&out), 0, "stderr={}", stderr_lossy(&out));
+
+    let stdout = stdout_lossy(&out);
+    assert!(
+        stdout.contains("⋯ and 3 other items ("),
+        "missing pruned summary row:\n{stdout}"
+    );
+    // Exactly one summary row at root level; the two kept dirs render first.
+    assert!(stdout.contains("d-big-a") && stdout.contains("d-big-b"));
+}
+
+// ---------------------------------------------------------------------------
+// Requested edge-case matrix: trash prompt wording + viz pruned summary
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_clean_trash_prompt_text() {
+    let (_guard, root, dir_item, file_item) = mock_cache();
+
+    // stdin is /dev/null: the interactive confirm reads EOF and cancels,
+    // but its prompt text has already been rendered to stdout.
+    let out = run(&[
+        "clean",
+        "--path",
+        root.to_str().unwrap(),
+        "--apply",
+        "--trash",
+    ]);
+    assert_eq!(code(&out), 0, "cancelled run must exit 0");
+
+    let stdout = stdout_lossy(&out);
+    let mentions_trash = stdout.contains("trash") || stdout.to_lowercase().contains("recycle bin");
+    assert!(
+        mentions_trash,
+        "prompt/banner must mention trash or recycle bin:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Permanently delete"),
+        "permanent-delete wording must not appear in --trash mode:\n{stdout}"
+    );
+
+    // Cancelled before execution: nothing was moved out of place.
+    assert!(dir_item.exists());
+    assert!(file_item.exists());
+}
+
+#[test]
+fn e2e_viz_top_n_shows_pruned_summary() {
+    let guard = TempDir::new().expect("tempdir");
+    // Ten files with strictly increasing sizes: sorted descending, f10..f08
+    // are the deterministic top 3 and the other 7 get aggregated.
+    for i in 1..=10_u32 {
+        fs::write(
+            guard.path().join(format!("f{i:02}.bin")),
+            vec![b'v'; (i as usize) * 4096],
+        )
+        .expect("write fixture");
+    }
+
+    let out = run(&["viz", guard.path().to_str().unwrap(), "--top", "3"]);
+    assert_eq!(code(&out), 0, "stderr={}", stderr_lossy(&out));
+
+    let stdout = stdout_lossy(&out);
+    for top in ["f10.bin", "f09.bin", "f08.bin"] {
+        assert!(stdout.contains(top), "expected top item {top}:\n{stdout}");
+    }
+    assert!(
+        stdout.contains("⋯ and 7 other items"),
+        "missing aggregated pruned row:\n{stdout}"
+    );
+}
