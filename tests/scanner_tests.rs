@@ -205,3 +205,29 @@ fn missing_root_reports_path_not_found() {
         DiskPulseError::Scan(ScanError::PathNotFound(_))
     ));
 }
+
+#[test]
+fn scan_target_with_ignored_or_hidden_name_is_not_pruned_as_root() {
+    // The scan root itself travels through process_read_dir in its own
+    // batch. Filtering by name without a depth-0 exemption would drop it
+    // and collapse the entire result.
+    for target_name in ["node_modules", ".cache-store"] {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join(target_name);
+        std::fs::create_dir_all(&root).unwrap();
+        write_file(&root, "payload.bin", 8 * KIB);
+
+        let hidden = ScanOptions {
+            include_hidden: false,
+            ..base_options()
+        };
+        let result = scan_path(&root, &hidden).unwrap();
+
+        assert_eq!(
+            names(&result.root),
+            vec!["payload.bin"],
+            "root {target_name:?} was pruned by its own name"
+        );
+        assert_eq!(result.root.size, 8 * KIB);
+    }
+}

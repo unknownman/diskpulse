@@ -229,27 +229,49 @@ pub struct CleanPlan {
 }
 
 impl CleanPlan {
+    /// The path shown for a target group in the plan table: a directory item
+    /// stands for itself; a file item is represented by its containing
+    /// directory, so summaries read as clean directory paths instead of deep
+    /// leaf names like `~/.cargo/registry/.../foo.crate`.
+    fn representative_path(item: &CleanItem) -> PathBuf {
+        if item.is_dir {
+            return item.path.clone();
+        }
+        match item.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => item.path.clone(),
+        }
+    }
+
     /// Build a plan from discovered items, computing totals and grouping the
     /// per-target breakdown automatically (summaries ordered by `target_id`).
     pub fn from_items(items: Vec<CleanItem>, is_dry_run: bool) -> Self {
         let total_items = items.len();
         let total_bytes = items.iter().map(|item| item.size).sum();
 
-        let mut grouped: BTreeMap<&str, (&str, PathBuf, usize, u64)> = BTreeMap::new();
+        // (target_name, display_path, path_is_from_a_dir_item, count, bytes)
+        let mut grouped: BTreeMap<&str, (&str, PathBuf, bool, usize, u64)> = BTreeMap::new();
         for item in &items {
             let entry = grouped.entry(item.target_id.as_str()).or_insert((
                 item.target_name.as_str(),
-                item.path.clone(),
+                Self::representative_path(item),
+                item.is_dir,
                 0,
                 0,
             ));
-            entry.2 += 1;
-            entry.3 += item.size;
+            // Prefer a directory's own path over a parent derived from a
+            // loose file: it is the most specific root for the group.
+            if item.is_dir && !entry.2 {
+                entry.1 = Self::representative_path(item);
+                entry.2 = true;
+            }
+            entry.3 += 1;
+            entry.4 += item.size;
         }
 
         let targets = grouped
             .into_iter()
-            .map(|(id, (name, path, count, bytes))| TargetSummary {
+            .map(|(id, (name, path, _, count, bytes))| TargetSummary {
                 target_id: id.to_owned(),
                 target_name: name.to_owned(),
                 path,
@@ -595,6 +617,30 @@ mod tests {
         assert_eq!(plan.targets[1].target_id, "npm-cache");
         assert_eq!(plan.targets[1].item_count, 1);
         assert_eq!(plan.targets[1].total_bytes, 400);
+    }
+
+    #[test]
+    fn from_items_representative_paths_prefer_dirs_and_parent_dirs() {
+        let file_a = clean_item("/root/cache/loose.bin", 10, "t", "Target");
+        let file_b = clean_item("/root/cache/other.bin", 20, "t", "Target");
+        let plan = CleanPlan::from_items(vec![file_a, file_b], true);
+        assert_eq!(
+            plan.targets[0].path,
+            PathBuf::from("/root/cache"),
+            "loose files are represented by their directory"
+        );
+
+        let deep_file = clean_item("/root/deep/nested/file.crate", 5, "t2", "Target");
+        let dir_item = CleanItem {
+            is_dir: true,
+            ..clean_item("/root/pkg-dir", 500, "t2", "Target")
+        };
+        let plan = CleanPlan::from_items(vec![deep_file, dir_item], true);
+        assert_eq!(
+            plan.targets[0].path,
+            PathBuf::from("/root/pkg-dir"),
+            "a directory item outranks a derived parent"
+        );
     }
 
     #[test]

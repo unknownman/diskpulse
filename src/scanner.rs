@@ -206,6 +206,7 @@ fn build_walker(
             busy_timeout: std::time::Duration::from_secs(60),
         })
         .process_read_dir(move |depth, _dir_path, _state, children| {
+            let _ = depth;
             // Unreadable entries and unreadable directories are counted, not fatal.
             children.retain(|result| match result {
                 Err(_) => {
@@ -220,14 +221,17 @@ fn build_walker(
                 }
             });
 
-            // The first batch holds only the scan root itself; never filter it.
-            let Some(_batch_depth) = depth else {
-                return;
-            };
-
+            // Name-based filters run for EVERY batch. jwalk delivers the
+            // scan-root entry itself in a separate batch; those depth-0
+            // entries are exempt from filtering, otherwise walking a target
+            // literally named `.cache` or `node_modules` would prune the
+            // root and collapse the whole result.
             children.retain(|result| match result {
                 Err(_) => false,
                 Ok(entry) => {
+                    if entry.depth == 0 {
+                        return true;
+                    }
                     let name = entry.file_name().to_string_lossy();
                     if !include_hidden && name.starts_with('.') {
                         return false;

@@ -76,6 +76,9 @@ fn home_sub(rel: &[&str]) -> Option<PathBuf> {
     })
 }
 
+/// `$XDG_CACHE_HOME`-style helper. Only the non-Windows target definitions
+/// reference it; on Windows the INetCache/browser paths are absolute.
+#[cfg(not(windows))]
 fn cache_sub(rel: &[&str]) -> Option<PathBuf> {
     let cache = base_dirs()?.cache_dir().to_path_buf();
     Some(rel.iter().fold(cache, |acc, part| acc.join(part)))
@@ -323,7 +326,13 @@ const SYSTEM_ROOTS: &[&str] = &[];
 fn system_roots() -> &'static [PathBuf] {
     static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
     ROOTS.get_or_init(|| {
-        let mut resolved = Vec::with_capacity(SYSTEM_ROOTS.len() * 2);
+        let mut resolved: Vec<PathBuf> = Vec::new();
+
+        // Windows honors the live environment first: boot drive, OS
+        // directory and install trees may sit on any volume.
+        #[cfg(windows)]
+        resolved.extend(windows_dynamic_system_roots());
+
         for root in SYSTEM_ROOTS {
             let path = PathBuf::from(root);
             if let Ok(canon) = fs::canonicalize(&path) {
@@ -335,6 +344,40 @@ fn system_roots() -> &'static [PathBuf] {
         }
         resolved
     })
+}
+
+/// Windows locations discovered from the environment at runtime: the active
+/// boot drive (`SystemDrive`, normalized `C:` → `C:\`), the OS directory
+/// (`SystemRoot`/`windir`) and program-install trees for both architectures.
+#[cfg(windows)]
+fn windows_dynamic_system_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(drive) = std::env::var("SystemDrive") {
+        let mut drive_root = drive.trim().to_owned();
+        if drive_root.is_empty() {
+            drive_root = String::from("C:");
+        }
+        if !drive_root.ends_with('\\') {
+            drive_root.push('\\');
+        }
+        roots.push(PathBuf::from(&drive_root));
+        roots.push(PathBuf::from(&drive_root).join("Windows"));
+    }
+    for key in [
+        "SystemRoot",
+        "windir",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                roots.push(PathBuf::from(value));
+            }
+        }
+    }
+    roots
 }
 
 /// Volatile temp areas that stay cleanable even though they live beneath
@@ -390,6 +433,14 @@ pub fn validate_path_safety(path: &Path) -> Result<(), SafetyError> {
 fn ensure_safe_location(normalized: &Path) -> Result<(), SafetyError> {
     // The temp carve-out runs first: `/var/tmp` must survive the `/var` rule.
     let under_temp = is_cleanable_temp(normalized);
+
+    // Bare filesystem/drive roots ("/" on POSIX, any "D:\"-style volume root
+    // on Windows) terminate in a root and therefore have no parent. They are
+    // never deletable themselves — even when not enumerated in the static
+    // jail lists.
+    if normalized.parent().is_none() && !under_temp {
+        return Err(SafetyError::ProtectedSystemPath(normalized.to_path_buf()));
+    }
 
     if !under_temp {
         for root in system_roots() {
@@ -654,8 +705,10 @@ fn collect_from_dir(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        // DirEntry::metadata never follows symlinks.
-        let meta = match entry.metadata() {
+        // Explicit symlink_metadata: classification must NEVER depend on
+        // following links, so an entry pointing outside the cache is always
+        // treated as a link unit, never as a local directory.
+        let meta = match fs::symlink_metadata(&path) {
             Ok(meta) => meta,
             Err(_) => continue,
         };
@@ -759,8 +812,13 @@ fn effective_cutoff(age: Option<Duration>) -> Option<SystemTime> {
     SystemTime::now().checked_sub(std_age)
 }
 
-/// Recursively sum allocated bytes of all regular files under `dir`,
-/// never following symlinks and skipping unreadable entries.
+/// Recursively sum allocated bytes of all regular files under `dir`.
+///
+/// Symlinks are strictly excluded: their type is taken from the directory
+/// entry itself (`entry.file_type()`, no stat at all), they are never pushed
+/// onto the traversal stack and contribute zero bytes. Without link descent,
+/// cycles through directory symlinks are impossible, so termination is
+/// guaranteed even in adversarial caches.
 fn tree_size(dir: &Path) -> u64 {
     let mut total = 0;
     let mut stack = vec![dir.to_path_buf()];
@@ -770,10 +828,16 @@ fn tree_size(dir: &Path) -> u64 {
             Err(_) => continue,
         };
         for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.file_type().is_dir() {
+            // Cheap classification straight from readdir; never follows.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(entry.path());
-            } else if !meta.file_type().is_symlink() {
+            } else if let Ok(meta) = entry.metadata() {
                 total += util::physical_disk_size(&meta);
             }
         }
@@ -861,9 +925,27 @@ fn remove_item(
     // Symlink quarantine: unlink the link itself, never its target. This
     // branch wins even when the link points at a directory.
     if meta.file_type().is_symlink() || !meta.is_dir() {
-        fs::remove_file(path)
-            .map(|_| CleanItemStatus::Deleted)
-            .map_err(|err| deletion_failed(path, err))
+        #[cfg(unix)]
+        {
+            fs::remove_file(path)
+                .map(|_| CleanItemStatus::Deleted)
+                .map_err(|err| deletion_failed(path, err))
+        }
+        // Windows: directory symlinks and junctions carry the DIRECTORY
+        // attribute on the link itself (`meta` is symlink_metadata) and
+        // fail remove_file with AccessDenied — they need rmdir semantics.
+        #[cfg(windows)]
+        {
+            if meta.is_dir() {
+                fs::remove_dir(path)
+                    .map(|_| CleanItemStatus::Deleted)
+                    .map_err(|err| deletion_failed(path, err))
+            } else {
+                fs::remove_file(path)
+                    .map(|_| CleanItemStatus::Deleted)
+                    .map_err(|err| deletion_failed(path, err))
+            }
+        }
     } else if is_dir {
         fs::remove_dir_all(path)
             .map(|_| CleanItemStatus::Deleted)
@@ -890,6 +972,16 @@ fn deletion_failed(path: &Path, source: std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jail_blocks_parentless_drive_and_filesystem_roots() {
+        // "/" on POSIX — and by the same rule any Windows drive root such as
+        // "D:\" whose Path::parent() is None — must never pass the jail,
+        // even when absent from the static lists.
+        let err =
+            ensure_safe_location(Path::new("/")).expect_err("parentless roots must be blocked");
+        assert!(matches!(err, SafetyError::ProtectedSystemPath(_)), "{err}");
+    }
 
     #[test]
     fn lexical_normalize_resolves_dots_without_fs() {

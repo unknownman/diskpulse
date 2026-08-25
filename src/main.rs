@@ -8,6 +8,7 @@
 //! * `2`   — CLI usage/validation error (bad flags, unknown target)
 //! * `130` — interrupted by SIGINT (Ctrl+C)
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -171,15 +172,10 @@ fn cmd_clean(args: &CleanArgs, cli: &Cli) -> Result<()> {
     }
 }
 
-/// True when stdin can actually deliver keystrokes to an interactive prompt.
-#[cfg(unix)]
+/// True when stdin is an interactive terminal. Uses the standard, fully
+/// safe [`IsTerminal`] trait — correct on Linux, macOS and Windows alike.
 fn stdin_is_interactive() -> bool {
-    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
-}
-
-#[cfg(not(unix))]
-fn stdin_is_interactive() -> bool {
-    true
+    std::io::stdin().is_terminal()
 }
 
 fn cmd_targets(args: &TargetsArgs, cli: &Cli) -> Result<()> {
