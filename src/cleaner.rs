@@ -455,8 +455,31 @@ fn is_cleanable_temp(normalized: &Path) -> bool {
 /// The path is canonicalized first so symlinks are judged by where they point,
 /// falling back to lexical normalization when the entry does not exist.
 pub fn validate_path_safety(path: &Path) -> Result<(), SafetyError> {
-    let normalized = fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path));
+    let normalized = canonicalize_for_jail(path);
     ensure_safe_location(&normalized)
+}
+
+/// Canonicalize for jail comparison. Windows `fs::canonicalize` returns
+/// verbatim paths (`\\?\C:\Users\me`); compared raw against plain paths
+/// from `directories`/env they never match, which would silently bypass
+/// every protection rule below. UNC form maps back to `\\srv\share`.
+fn canonicalize_for_jail(path: &Path) -> PathBuf {
+    let canon = fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path));
+    strip_verbatim_prefix(canon)
+}
+
+fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
 }
 
 /// Jail check for an already-normalized path.
@@ -1002,7 +1025,7 @@ fn remove_item(
     } else {
         // The entry exists, so canonicalization normally succeeds; the
         // lexical fallback covers races where it vanishes mid-check.
-        fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+        canonicalize_for_jail(path)
     };
     if let Err(safety) = ensure_safe_location(&jail_target) {
         return Err(format!("blocked by safety jail: {safety}"));
@@ -1256,6 +1279,26 @@ mod tests {
 
         let cache = home.join(".cache").join("diskpulse_test");
         assert!(ensure_safe_location(&cache).is_ok());
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_stripped_before_comparison() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\me")),
+                PathBuf::from(r"C:\Users\me")
+            );
+            assert_eq!(
+                strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\srv\share")),
+                PathBuf::from(r"\\srv\share")
+            );
+        }
+        #[cfg(unix)]
+        {
+            let plain = PathBuf::from("/tmp/unchanged");
+            assert_eq!(strip_verbatim_prefix(plain.clone()), plain);
+        }
     }
 
     #[test]

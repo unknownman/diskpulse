@@ -111,7 +111,11 @@ fn ignored_directories_are_pruned_unless_disabled() {
     assert_eq!(result.root.size, 4 * KIB);
 
     let result = scan_path(root, &base_options()).unwrap();
-    assert_eq!(names(&result.root), vec!["node_modules", "src"]);
+    // Equal sizes fall back to readdir order, which differs per platform;
+    // only membership matters here (size ordering is pinned elsewhere).
+    let mut pruned_off = names(&result.root);
+    pruned_off.sort_unstable();
+    assert_eq!(pruned_off, vec!["node_modules", "src"]);
     assert_eq!(result.root.size, 8 * KIB);
 }
 
@@ -131,7 +135,9 @@ fn hidden_entries_are_filtered_per_option() {
     assert_eq!(result.root.size, 4 * KIB);
 
     let result = scan_path(root, &base_options()).unwrap();
-    assert_eq!(names(&result.root), vec![".secret_dir", "public_dir"]);
+    let mut visible = names(&result.root);
+    visible.sort_unstable();
+    assert_eq!(visible, vec![".secret_dir", "public_dir"]);
     assert_eq!(result.root.size, 8 * KIB);
 }
 
