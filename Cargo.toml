@@ -1,12 +1,12 @@
 [package]
 name = "diskpulse"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A fast, safe, and beautiful disk visualizer and cache cleaner"
 license = "MIT OR Apache-2.0"
-# TODO: replace OWNER with the real GitHub username/org before publishing.
-repository = "https://github.com/OWNER/diskpulse"
-homepage = "https://github.com/OWNER/diskpulse"
+# Verified live at https://crates.io/crates/diskpulse
+repository = "https://github.com/unknownman/diskpulse"
+homepage = "https://github.com/unknownman/diskpulse"
 readme = "README.md"
 keywords = ["disk-usage", "cli", "cleanup", "cache", "visualizer"]
 categories = ["command-line-utilities", "filesystem"]

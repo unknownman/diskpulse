@@ -1,11 +1,8 @@
-<!-- NOTE: Badges and repository URLs below use the placeholder path
-     "OWNER/diskpulse". Replace OWNER with the real GitHub username/org
-     before publishing. -->
 # diskpulse
 
 [![crates.io](https://img.shields.io/crates/v/diskpulse.svg)](https://crates.io/crates/diskpulse)
 [![license](https://img.shields.io/crates/l/diskpulse.svg)](#license)
-[![CI](https://github.com/OWNER/diskpulse/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/diskpulse/actions/workflows/ci.yml)
+[![CI](https://github.com/unknownman/diskpulse/actions/workflows/ci.yml/badge.svg)](https://github.com/unknownman/diskpulse/actions/workflows/ci.yml)
 
 ![diskpulse demo](demo/diskpulse-demo.gif)
 
@@ -69,7 +66,7 @@ cargo install diskpulse
 ### From source
 
 ```bash
-git clone https://github.com/OWNER/diskpulse
+git clone https://github.com/unknownman/diskpulse
 cd diskpulse
 cargo build --release
 # binary at target/release/diskpulse
@@ -78,21 +75,21 @@ cargo build --release
 ### Pre-built binaries
 
 Grab an archive from the
-[GitHub Releases](https://github.com/OWNER/diskpulse/releases) page, which is
+[GitHub Releases](https://github.com/unknownman/diskpulse/releases) page, which is
 populated automatically by the release workflow for these platforms:
 Linux x86_64, Linux aarch64, macOS x86_64, macOS arm64, Windows x86_64.
 
 ```bash
 # Linux x86_64
-curl -LO https://github.com/OWNER/diskpulse/releases/download/v0.1.0/diskpulse-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/unknownman/diskpulse/releases/download/v0.1.0/diskpulse-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
 tar xzf diskpulse-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
 
 # macOS arm64 (Apple Silicon)
-curl -LO https://github.com/OWNER/diskpulse/releases/download/v0.1.0/diskpulse-v0.1.0-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/unknownman/diskpulse/releases/download/v0.1.0/diskpulse-v0.1.0-aarch64-apple-darwin.tar.gz
 tar xzf diskpulse-v0.1.0-aarch64-apple-darwin.tar.gz
 
 # macOS x86_64
-curl -LO https://github.com/OWNER/diskpulse/releases/download/v0.1.0/diskpulse-v0.1.0-x86_64-apple-darwin.tar.gz
+curl -LO https://github.com/unknownman/diskpulse/releases/download/v0.1.0/diskpulse-v0.1.0-x86_64-apple-darwin.tar.gz
 
 # Windows x86_64 (PowerShell): diskpulse-v0.1.0-x86_64-pc-windows-msvc.zip
 ```
